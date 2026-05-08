@@ -117,6 +117,11 @@ QPushButton:hover {{
     border-color: {COLORS['accent']};
     color: {COLORS['accent']};
 }}
+QPushButton:pressed {{
+    background-color: {COLORS['surface']};
+    border-color: {COLORS['accent']};
+    color: {COLORS['accent']};
+}}
 QPushButton:disabled {{
     background-color: {COLORS['surface']};
     border-color: {COLORS['border']};
@@ -128,6 +133,7 @@ QPushButton#start_btn {{
     color: {COLORS['green']};
 }}
 QPushButton#start_btn:hover {{ background-color: #1e4d29; }}
+QPushButton#start_btn:pressed {{ background-color: #0f2415; }}
 QPushButton#start_btn:disabled {{
     background-color: {COLORS['surface']};
     border-color: {COLORS['border']};
@@ -139,6 +145,7 @@ QPushButton#stop_btn {{
     color: {COLORS['red']};
 }}
 QPushButton#stop_btn:hover {{ background-color: #4d1e1e; }}
+QPushButton#stop_btn:pressed {{ background-color: #240f0f; }}
 QPushButton#stop_btn:disabled {{
     background-color: {COLORS['surface']};
     border-color: {COLORS['border']};
@@ -149,12 +156,20 @@ QPushButton#connect_btn {{
     border-color: {COLORS['accent']};
     color: {COLORS['accent']};
 }}
+QPushButton#connect_btn:hover {{ background-color: #1e3a4d; }}
+QPushButton#connect_btn:pressed {{ background-color: #0f1f2e; border-color: {COLORS['accent']}; }}
 QPushButton#clear_btn {{
     background-color: {COLORS['surface2']};
     border-color: {COLORS['border']};
     padding: 4px 10px;
     font-size: 10px;
 }}
+QPushButton#clear_btn:hover {{
+    background-color: {COLORS['border']};
+    border-color: {COLORS['text_dim']};
+    color: {COLORS['text']};
+}}
+QPushButton#clear_btn:pressed {{ background-color: {COLORS['surface']}; }}
 QLabel#section_label {{
     color: {COLORS['accent']};
     font-size: 10px;
@@ -738,7 +753,7 @@ class MainWindow(QMainWindow):
         def row(label, widget):
             r = grid.rowCount()
             lbl = QLabel(label)
-            lbl.setStyleSheet(f"color:{COLORS['text_dim']};font-size:11px;")
+            lbl.setStyleSheet(f"color:{COLORS['text_dim']};font-size:14px;background-color:transparent;")
             grid.addWidget(lbl, r, 0)
             grid.addWidget(widget, r, 1)
 
@@ -771,7 +786,7 @@ class MainWindow(QMainWindow):
         def row(label, widget):
             r = grid.rowCount()
             lbl = QLabel(label)
-            lbl.setStyleSheet(f"color:{COLORS['text_dim']};font-size:11px;")
+            lbl.setStyleSheet(f"color:{COLORS['text_dim']};font-size:14px;background-color:transparent;")
             grid.addWidget(lbl, r, 0)
             grid.addWidget(widget, r, 1)
 
@@ -791,7 +806,7 @@ class MainWindow(QMainWindow):
         row("Max Env Gain", self.gain_max)
 
         self.clip_label = QLabel("")
-        self.clip_label.setStyleSheet(f"color:{COLORS['red']};font-size:10px;")
+        self.clip_label.setStyleSheet(f"color:{COLORS['red']};font-size:10px;background-color:transparent;")
         grid.addWidget(self.clip_label, grid.rowCount(), 0, 1, 3)
         return box
 

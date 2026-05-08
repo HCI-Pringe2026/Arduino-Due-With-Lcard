@@ -34,6 +34,8 @@
  *   • DBG telemetry: JSON lines at ~10 Hz when enabled
  */
 
+#define SERIAL_RX_BUFFER_SIZE 256
+
 #include <Arduino.h>
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -371,6 +373,9 @@ void setup() {
     setupDACC();
     recomputeIncrements();
     setupTimer(g_sampleRate);
+
+    NVIC_SetPriority(UART_IRQn, 0);    // highest priority
+    NVIC_SetPriority(TC6_IRQn, 1);    // lower priority (0 = highest, 15 = lowest)
 
     Serial.println("READY dual_sine_dac v3.0 (envelope+fix)");
 }

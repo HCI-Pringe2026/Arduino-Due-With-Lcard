@@ -1,918 +1,1136 @@
-#!/usr/bin/env python3
 """
-Arduino Due DAC Controller
-PySide6 GUI for real-time control of the Arduino Due two-channel DAC signal generator.
+dual_sine_controller.py
+PySide6 desktop app for controlling the Arduino Due dual-sine DAC firmware.
+
+Requirements:
+    pip install PySide6 pyserial numpy matplotlib
+
+Usage:
+    python dual_sine_controller.py
 """
 
-import json
 import sys
-import threading
+import json
 import time
+import threading
+from collections import deque
 
+import numpy as np
 import serial
 import serial.tools.list_ports
-from PySide6.QtCore import (QObject, QTimer, Signal, Slot, Qt)
-from PySide6.QtGui import QColor, QFont, QPainter, QPen, QLinearGradient, QPalette
+
+from PySide6.QtCore import (
+    Qt, QTimer, Signal, QObject, QThread, Slot
+)
+from PySide6.QtGui import (
+    QColor, QFont, QPalette, QFontDatabase, QTextCursor
+)
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QGridLayout, QLabel, QComboBox, QPushButton, QSlider, QDoubleSpinBox,
-    QGroupBox, QStatusBar, QFrame, QSizePolicy, QSpacerItem, QTabWidget,
-    QLineEdit, QTextEdit, QScrollArea
+    QGridLayout, QLabel, QDoubleSpinBox, QSpinBox, QPushButton,
+    QComboBox, QGroupBox, QStatusBar, QFrame, QSizePolicy,
+    QSplitter, QSlider, QCheckBox, QTextEdit, QLineEdit, QTabWidget
 )
 
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
 
-# ─────────────────────────── Palette & Fonts ───────────────────────────
+# ── Palette ───────────────────────────────────────────────────────────────────
+COLORS = {
+    "bg":        "#0d0f14",
+    "surface":   "#161921",
+    "surface2":  "#1e2330",
+    "border":    "#2a3045",
+    "accent":    "#00e5ff",
+    "accent2":   "#ff6b35",
+    "accent3":   "#7c3aed",
+    "text":      "#e2e8f0",
+    "text_dim":  "#64748b",
+    "green":     "#22c55e",
+    "red":       "#ef4444",
+    "yellow":    "#facc15",
+    "sine1":     "#00e5ff",
+    "sine2":     "#ff6b35",
+    "combined":  "#a78bfa",
+}
 
-DARK_BG      = "#0e1117"
-PANEL_BG     = "#161b25"
-PANEL_BORDER = "#1f2a3c"
-ACCENT_CYAN  = "#00d4ff"
-ACCENT_GREEN = "#00ff9d"
-ACCENT_AMBER = "#ffb830"
-ACCENT_RED   = "#ff4d6d"
-TEXT_MAIN    = "#e8edf5"
-TEXT_DIM     = "#5a6a82"
-BUTTON_BG    = "#1e2d42"
-BUTTON_HOV   = "#243550"
-
-FONT_MONO  = "JetBrains Mono, Consolas, monospace"
-FONT_LABEL = "Segoe UI, Helvetica Neue, Arial, sans-serif"
-
-SHAPES = ["sine", "square", "triangle", "ramp", "dc"]
-
-DAC_VMIN = 0.55
-DAC_VMAX = 2.75
-
-STYLESHEET = f"""
+STYLE = f"""
 QMainWindow, QWidget {{
-    background-color: {DARK_BG};
-    color: {TEXT_MAIN};
-    font-family: {FONT_LABEL};
-    font-size: 13px;
+    background-color: {COLORS['bg']};
+    color: {COLORS['text']};
+    font-family: 'JetBrains Mono', 'Consolas', monospace;
+    font-size: 12px;
 }}
 QGroupBox {{
-    background-color: {PANEL_BG};
-    border: 1px solid {PANEL_BORDER};
+    background-color: {COLORS['surface']};
+    border: 1px solid {COLORS['border']};
     border-radius: 8px;
-    margin-top: 10px;
-    padding: 12px 10px 10px 10px;
-    font-weight: 600;
+    margin-top: 20px;
+    padding: 12px 8px 8px 8px;
     font-size: 11px;
-    letter-spacing: 1.5px;
-    color: {TEXT_DIM};
+    font-weight: bold;
+    color: {COLORS['text_dim']};
+    letter-spacing: 1px;
     text-transform: uppercase;
 }}
 QGroupBox::title {{
     subcontrol-origin: margin;
-    subcontrol-position: top left;
-    left: 12px;
-    top: 2px;
-    padding: 0 4px;
+    left: 10px;
+    padding: 0 6px;
+}}
+QDoubleSpinBox, QSpinBox {{
+    background-color: {COLORS['surface2']};
+    border: 1px solid {COLORS['border']};
+    border-radius: 4px;
+    color: {COLORS['text']};
+    padding: 4px 8px;
+    min-width: 90px;
+    font-family: 'JetBrains Mono', monospace;
+}}
+QDoubleSpinBox:focus, QSpinBox:focus {{
+    border: 1px solid {COLORS['accent']};
+}}
+QComboBox {{
+    background-color: {COLORS['surface2']};
+    border: 1px solid {COLORS['border']};
+    border-radius: 4px;
+    color: {COLORS['text']};
+    padding: 4px 8px;
+    min-width: 160px;
+}}
+QComboBox::drop-down {{ border: none; }}
+QComboBox QAbstractItemView {{
+    background-color: {COLORS['surface2']};
+    color: {COLORS['text']};
+    selection-background-color: {COLORS['border']};
 }}
 QPushButton {{
-    background-color: {BUTTON_BG};
-    color: {TEXT_MAIN};
-    border: 1px solid {PANEL_BORDER};
-    border-radius: 6px;
-    padding: 6px 16px;
-    font-size: 12px;
-    font-weight: 600;
+    background-color: {COLORS['surface2']};
+    border: 1px solid {COLORS['border']};
+    border-radius: 5px;
+    color: {COLORS['text']};
+    padding: 7px 18px;
+    font-weight: bold;
     letter-spacing: 0.5px;
 }}
 QPushButton:hover {{
-    background-color: {BUTTON_HOV};
-    border-color: {ACCENT_CYAN};
-    color: {ACCENT_CYAN};
+    border-color: {COLORS['accent']};
+    color: {COLORS['accent']};
 }}
 QPushButton:pressed {{
-    background-color: {ACCENT_CYAN};
-    color: {DARK_BG};
+    background-color: {COLORS['surface']};
+    border-color: {COLORS['accent']};
+    color: {COLORS['accent']};
 }}
 QPushButton:disabled {{
-    color: {TEXT_DIM};
-    border-color: {PANEL_BORDER};
-    background-color: {PANEL_BG};
+    background-color: {COLORS['surface']};
+    border-color: {COLORS['border']};
+    color: {COLORS['text_dim']};
 }}
-QPushButton#accent {{
-    background-color: {ACCENT_CYAN};
-    color: {DARK_BG};
-    border-color: {ACCENT_CYAN};
+QPushButton#start_btn {{
+    background-color: #163a20;
+    border-color: {COLORS['green']};
+    color: {COLORS['green']};
 }}
-QPushButton#accent:hover {{
-    background-color: #33dcff;
-    color: {DARK_BG};
+QPushButton#start_btn:hover {{ background-color: #1e4d29; }}
+QPushButton#start_btn:pressed {{ background-color: #0f2415; }}
+QPushButton#start_btn:disabled {{
+    background-color: {COLORS['surface']};
+    border-color: {COLORS['border']};
+    color: {COLORS['text_dim']};
 }}
-QPushButton#danger {{
-    background-color: transparent;
-    color: {ACCENT_RED};
-    border-color: {ACCENT_RED};
+QPushButton#stop_btn {{
+    background-color: #3a1616;
+    border-color: {COLORS['red']};
+    color: {COLORS['red']};
 }}
-QPushButton#danger:hover {{
-    background-color: {ACCENT_RED};
-    color: white;
+QPushButton#stop_btn:hover {{ background-color: #4d1e1e; }}
+QPushButton#stop_btn:pressed {{ background-color: #240f0f; }}
+QPushButton#stop_btn:disabled {{
+    background-color: {COLORS['surface']};
+    border-color: {COLORS['border']};
+    color: {COLORS['text_dim']};
 }}
-QPushButton#green {{
-    background-color: transparent;
-    color: {ACCENT_GREEN};
-    border-color: {ACCENT_GREEN};
+QPushButton#connect_btn {{
+    background-color: #162a3a;
+    border-color: {COLORS['accent']};
+    color: {COLORS['accent']};
 }}
-QPushButton#green:hover {{
-    background-color: {ACCENT_GREEN};
-    color: {DARK_BG};
+QPushButton#connect_btn:hover {{ background-color: #1e3a4d; }}
+QPushButton#connect_btn:pressed {{ background-color: #0f1f2e; border-color: {COLORS['accent']}; }}
+QPushButton#clear_btn {{
+    background-color: {COLORS['surface2']};
+    border-color: {COLORS['border']};
+    padding: 4px 10px;
+    font-size: 10px;
 }}
-QComboBox {{
-    background-color: {BUTTON_BG};
-    color: {TEXT_MAIN};
-    border: 1px solid {PANEL_BORDER};
-    border-radius: 6px;
-    padding: 5px 10px;
-    font-size: 13px;
+QPushButton#clear_btn:hover {{
+    background-color: {COLORS['border']};
+    border-color: {COLORS['text_dim']};
+    color: {COLORS['text']};
 }}
-QComboBox:hover {{
-    border-color: {ACCENT_CYAN};
-}}
-QComboBox QAbstractItemView {{
-    background-color: {PANEL_BG};
-    color: {TEXT_MAIN};
-    border: 1px solid {PANEL_BORDER};
-    selection-background-color: {BUTTON_HOV};
-}}
-QDoubleSpinBox, QSpinBox, QLineEdit {{
-    background-color: {BUTTON_BG};
-    color: {TEXT_MAIN};
-    border: 1px solid {PANEL_BORDER};
-    border-radius: 6px;
-    padding: 5px 8px;
-    font-size: 13px;
-    font-family: {FONT_MONO};
-}}
-QDoubleSpinBox:focus, QSpinBox:focus, QLineEdit:focus {{
-    border-color: {ACCENT_CYAN};
-}}
-QSlider::groove:horizontal {{
-    height: 4px;
-    background: {PANEL_BORDER};
-    border-radius: 2px;
-}}
-QSlider::handle:horizontal {{
-    background: {ACCENT_CYAN};
-    width: 14px;
-    height: 14px;
-    margin: -5px 0;
-    border-radius: 7px;
-}}
-QSlider::sub-page:horizontal {{
-    background: {ACCENT_CYAN};
-    border-radius: 2px;
-}}
-QTextEdit {{
-    background-color: #090d13;
-    color: {ACCENT_GREEN};
-    border: 1px solid {PANEL_BORDER};
-    border-radius: 6px;
-    font-family: {FONT_MONO};
-    font-size: 12px;
-    padding: 6px;
+QPushButton#clear_btn:pressed {{ background-color: {COLORS['surface']}; }}
+QLabel#section_label {{
+    color: {COLORS['accent']};
+    font-size: 10px;
+    letter-spacing: 2px;
+    font-weight: bold;
 }}
 QStatusBar {{
-    background-color: {PANEL_BG};
-    color: {TEXT_DIM};
-    border-top: 1px solid {PANEL_BORDER};
-    font-size: 12px;
+    background-color: {COLORS['surface']};
+    border-top: 1px solid {COLORS['border']};
+    color: {COLORS['text_dim']};
+    font-size: 11px;
 }}
+QTextEdit {{
+    background-color: {COLORS['surface']};
+    border: 1px solid {COLORS['border']};
+    border-radius: 4px;
+    color: {COLORS['text']};
+    font-family: 'JetBrains Mono', 'Consolas', monospace;
+    font-size: 11px;
+    selection-background-color: {COLORS['border']};
+}}
+QLineEdit {{
+    background-color: {COLORS['surface2']};
+    border: 1px solid {COLORS['border']};
+    border-radius: 4px;
+    color: {COLORS['text']};
+    padding: 4px 8px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+}}
+QLineEdit:focus {{ border-color: {COLORS['accent']}; }}
 QTabWidget::pane {{
-    border: 1px solid {PANEL_BORDER};
-    border-radius: 8px;
-    background-color: {PANEL_BG};
+    border: 1px solid {COLORS['border']};
+    background-color: {COLORS['surface']};
+    border-radius: 4px;
 }}
 QTabBar::tab {{
-    background-color: {DARK_BG};
-    color: {TEXT_DIM};
-    border: 1px solid {PANEL_BORDER};
-    border-bottom: none;
-    padding: 7px 20px;
-    border-top-left-radius: 6px;
-    border-top-right-radius: 6px;
-    font-size: 12px;
-    font-weight: 600;
-    letter-spacing: 0.5px;
+    background-color: {COLORS['surface2']};
+    border: 1px solid {COLORS['border']};
+    padding: 5px 14px;
+    color: {COLORS['text_dim']};
+    font-size: 10px;
+    letter-spacing: 1px;
 }}
 QTabBar::tab:selected {{
-    color: {ACCENT_CYAN};
-    border-bottom: 2px solid {ACCENT_CYAN};
-    background-color: {PANEL_BG};
+    background-color: {COLORS['surface']};
+    color: {COLORS['accent']};
+    border-bottom-color: {COLORS['surface']};
 }}
-QLabel#title {{
-    font-size: 22px;
-    font-weight: 700;
-    letter-spacing: 2px;
-    color: {ACCENT_CYAN};
+QFrame#divider {{
+    background-color: {COLORS['border']};
+    max-height: 1px;
 }}
-QLabel#subtitle {{
+QCheckBox {{
+    color: {COLORS['text_dim']};
     font-size: 11px;
-    letter-spacing: 3px;
-    color: {TEXT_DIM};
-    text-transform: uppercase;
+    spacing: 6px;
 }}
-QLabel#volt {{
-    font-family: {FONT_MONO};
-    font-size: 24px;
-    font-weight: 700;
-    color: {ACCENT_CYAN};
+QCheckBox::indicator {{
+    width: 14px; height: 14px;
+    border: 1px solid {COLORS['border']};
+    border-radius: 3px;
+    background: {COLORS['surface2']};
 }}
-QLabel#volt1 {{
-    font-family: {FONT_MONO};
-    font-size: 24px;
-    font-weight: 700;
-    color: {ACCENT_GREEN};
-}}
-QLabel#status_ok {{
-    color: {ACCENT_GREEN};
-    font-size: 12px;
-    font-weight: 600;
-}}
-QLabel#status_err {{
-    color: {ACCENT_RED};
-    font-size: 12px;
-    font-weight: 600;
-}}
-QFrame#sep {{
-    color: {PANEL_BORDER};
+QCheckBox::indicator:checked {{
+    background: {COLORS['accent']};
+    border-color: {COLORS['accent']};
 }}
 """
 
-
-# ─────────────────────── Serial Worker Thread ────────────────────────
-
+# ── Serial worker ─────────────────────────────────────────────────────────────
 class SerialWorker(QObject):
-    received      = Signal(str)
-    connected     = Signal()
-    disconnected  = Signal()
-    error         = Signal(str)
+    message_received = Signal(str)   # raw line from board
+    error_occurred   = Signal(str)
+    connected        = Signal(bool)
 
     def __init__(self):
         super().__init__()
         self._port: serial.Serial | None = None
-        self._running = False
         self._lock = threading.Lock()
 
-    def open(self, port: str, baud: int = 115200):
+    def open(self, port: str, baud: int = 115200) -> bool:
         try:
-            s = serial.Serial(port, baud, timeout=0.1)
             with self._lock:
                 if self._port and self._port.is_open:
                     self._port.close()
-                self._port = s
-            self._running = True
-            t = threading.Thread(target=self._read_loop, daemon=True)
-            t.start()
-            self.connected.emit()
+                self._port = serial.Serial(port, baud, timeout=0.1)
+                time.sleep(2)
+                self._port.reset_input_buffer()
+            self.connected.emit(True)
+            return True
         except Exception as e:
-            self.error.emit(str(e))
+            self.error_occurred.emit(str(e))
+            self.connected.emit(False)
+            return False
 
     def close(self):
-        self._running = False
         with self._lock:
             if self._port and self._port.is_open:
                 self._port.close()
-                self._port = None
-        self.disconnected.emit()
+        self.connected.emit(False)
 
-    def send(self, cmd: str):
+    def send(self, cmd: str) -> str | None:
+        """Send a command and return the first non-empty response line (≤300 ms)."""
         with self._lock:
-            if self._port and self._port.is_open:
-                try:
-                    self._port.write((cmd.strip() + "\n").encode())
-                except Exception as e:
-                    self.error.emit(str(e))
-
-    def _read_loop(self):
-        while self._running:
+            if not self._port or not self._port.is_open:
+                return None
             try:
-                with self._lock:
-                    port = self._port
-                if port and port.is_open:
-                    line = port.readline().decode(errors="replace").strip()
+                self._port.reset_input_buffer()   # flush stale bytes
+                self._port.write((cmd.strip() + "\n").encode())
+                deadline = time.time() + 0.3
+                while time.time() < deadline:
+                    line = self._port.readline().decode(errors="replace").strip()
                     if line:
-                        self.received.emit(line)
-                else:
-                    time.sleep(0.05)
+                        self.message_received.emit(f"← {line}")
+                        return line
+                return None
             except Exception as e:
-                self.error.emit(str(e))
-                break
-        self.disconnected.emit()
+                self.error_occurred.emit(str(e))
+                return None
+
+    def drain(self) -> list[str]:
+        """Non-blocking read of all available lines (used for debug telemetry)."""
+        lines = []
+        with self._lock:
+            if not self._port or not self._port.is_open:
+                return lines
+            try:
+                while self._port.in_waiting:
+                    line = self._port.readline().decode(errors="replace").strip()
+                    if line:
+                        lines.append(line)
+            except Exception:
+                pass
+        return lines
 
     @property
-    def is_open(self):
+    def is_open(self) -> bool:
         with self._lock:
             return self._port is not None and self._port.is_open
 
 
-# ─────────────────────── Waveform Preview Widget ─────────────────────
+# ── Waveform canvas ───────────────────────────────────────────────────────────
+class WaveformCanvas(FigureCanvas):
+    def __init__(self):
+        self.fig = Figure(figsize=(6, 3), facecolor=COLORS["bg"])
+        super().__init__(self.fig)
+        self.ax = self.fig.add_subplot(111)
+        self._style_axes()
+        self.setMinimumHeight(180)
 
-class WavePreview(QWidget):
-    def __init__(self, color: str, parent=None):
-        super().__init__(parent)
-        self.setMinimumSize(180, 60)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self._color = QColor(color)
-        self._shape = "sine"
-        self._freq = 1.0
-        self._phase = 0.0
-        self._anim_offset = 0.0
-        self._timer = QTimer(self)
-        self._timer.setInterval(30)
-        self._timer.timeout.connect(self._tick)
-        self._timer.start()
+    def _style_axes(self):
+        ax = self.ax
+        ax.set_facecolor(COLORS["surface"])
+        for spine in ax.spines.values():
+            spine.set_color(COLORS["border"])
+        ax.tick_params(colors=COLORS["text_dim"], labelsize=8)
+        ax.xaxis.label.set_color(COLORS["text_dim"])
+        ax.yaxis.label.set_color(COLORS["text_dim"])
+        ax.set_ylim(-0.1, 3.4)
+        ax.set_xlabel("time (ms)", fontsize=8)
+        ax.set_ylabel("V", fontsize=8)
+        self.fig.tight_layout(pad=1.2)
 
-    def set_wave(self, shape: str, freq: float, phase: float):
-        self._shape = shape
-        self._freq = freq
-        self._phase = phase
+    def update_plot(self, a1, f1, p1_deg, a2, f2, p2_deg, dc, sr, gain_max):
+        self.ax.cla()
+        self._style_axes()
 
-    def _tick(self):
-        self._anim_offset += 0.04 * max(0.1, min(self._freq, 5.0))
-        self.update()
+        f_min    = min(f1, f2) if min(f1, f2) > 0 else max(f1, f2)
 
-    def paintEvent(self, event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
-
-        w, h = self.width(), self.height()
-        margin = 4
-        pw, ph = w - margin * 2, h - margin * 2
-
-        # Background
-        p.fillRect(0, 0, w, h, QColor("#090d13"))
-
-        # Grid lines
-        grid_pen = QPen(QColor(PANEL_BORDER), 1)
-        p.setPen(grid_pen)
-        for i in range(1, 4):
-            y = margin + ph * i // 4
-            p.drawLine(margin, y, w - margin, y)
-
-        if self._shape == "dc":
-            pen = QPen(self._color, 2)
-            p.setPen(pen)
-            mid = margin + ph // 2
-            p.drawLine(margin, mid, w - margin, mid)
-            return
-
-        cycles = 2.5
-        pen = QPen(self._color, 2)
-        pen.setCapStyle(Qt.RoundCap)
-        p.setPen(pen)
-
-        pts = []
-        N = pw
-        for i in range(N):
-            x = margin + i
-            phase = (i / N * cycles + self._anim_offset) % 1.0
-            if self._shape == "sine":
-                v = 0.5 + 0.5 * __import__("math").sin(6.283185 * phase)
-            elif self._shape == "square":
-                v = 0.0 if phase < 0.5 else 1.0
-            elif self._shape == "triangle":
-                v = phase * 2 if phase < 0.5 else (1.0 - phase) * 2
-            elif self._shape == "ramp":
-                v = phase
-            else:
-                v = 0.5
-            y = margin + ph - int(v * ph)
-            pts.append((x, y))
-
-        for i in range(len(pts) - 1):
-            p.drawLine(pts[i][0], pts[i][1], pts[i+1][0], pts[i+1][1])
-
-
-# ─────────────────────── Single Channel Panel ─────────────────────────
-
-class ChannelPanel(QGroupBox):
-    command_ready = Signal(str)
-
-    def __init__(self, channel: int, color: str, parent=None):
-        label = f"DAC {channel}  ·  {'CYAN' if channel == 0 else 'GREEN'}"
-        super().__init__(label, parent)
-        self.channel = channel
-        self.color = color
-        self._build_ui()
-
-    def _build_ui(self):
-        root = QVBoxLayout(self)
-        root.setSpacing(10)
-
-        # Waveform preview
-        self.preview = WavePreview(self.color)
-        root.addWidget(self.preview)
-
-        # Voltage readout
-        volt_row = QHBoxLayout()
-        self.volt_label = QLabel("─.── V")
-        self.volt_label.setObjectName("volt" if self.channel == 0 else "volt1")
-        self.volt_label.setAlignment(Qt.AlignCenter)
-        volt_row.addWidget(self.volt_label)
-        root.addLayout(volt_row)
-
-        sep = QFrame()
-        sep.setFrameShape(QFrame.HLine)
-        sep.setObjectName("sep")
-        root.addWidget(sep)
-
-        # Shape selector
-        shape_row = QHBoxLayout()
-        shape_row.addWidget(QLabel("Shape"))
-        self.shape_combo = QComboBox()
-        self.shape_combo.addItems([s.capitalize() for s in SHAPES])
-        shape_row.addWidget(self.shape_combo, 1)
-        root.addLayout(shape_row)
-
-        # Frequency
-        freq_row = QHBoxLayout()
-        freq_row.addWidget(QLabel("Freq (Hz)"))
-        self.freq_spin = QDoubleSpinBox()
-        self.freq_spin.setRange(0.01, 100.0)
-        self.freq_spin.setValue(1.0)
-        self.freq_spin.setDecimals(2)
-        self.freq_spin.setSingleStep(0.5)
-        freq_row.addWidget(self.freq_spin, 1)
-        root.addLayout(freq_row)
-
-        # Amplitude
-        amp_row = QHBoxLayout()
-        amp_row.addWidget(QLabel("Amp (Vpp)"))
-        self.amp_spin = QDoubleSpinBox()
-        self.amp_spin.setRange(0.0, DAC_VMAX - DAC_VMIN)
-        self.amp_spin.setValue(1.0)
-        self.amp_spin.setDecimals(3)
-        self.amp_spin.setSingleStep(0.1)
-        amp_row.addWidget(self.amp_spin, 1)
-        root.addLayout(amp_row)
-
-        # Offset / voltage slider
-        off_row = QHBoxLayout()
-        off_row.addWidget(QLabel("Offset (V)"))
-        self.offset_spin = QDoubleSpinBox()
-        self.offset_spin.setRange(DAC_VMIN, DAC_VMAX)
-        self.offset_spin.setValue(1.65)
-        self.offset_spin.setDecimals(3)
-        self.offset_spin.setSingleStep(0.05)
-        off_row.addWidget(self.offset_spin, 1)
-        root.addLayout(off_row)
-
-        # Phase
-        phase_row = QHBoxLayout()
-        phase_row.addWidget(QLabel("Phase (°)"))
-        self.phase_spin = QDoubleSpinBox()
-        self.phase_spin.setRange(-360.0, 360.0)
-        self.phase_spin.setValue(0.0)
-        self.phase_spin.setDecimals(1)
-        self.phase_spin.setSingleStep(10.0)
-        phase_row.addWidget(self.phase_spin, 1)
-        root.addLayout(phase_row)
-
-        sep2 = QFrame()
-        sep2.setFrameShape(QFrame.HLine)
-        sep2.setObjectName("sep")
-        root.addWidget(sep2)
-
-        # Action buttons
-        btn_row = QHBoxLayout()
-        self.apply_btn = QPushButton("▶  Apply")
-        self.apply_btn.setObjectName("accent" if self.channel == 0 else "green")
-        self.apply_btn.clicked.connect(self._apply)
-        btn_row.addWidget(self.apply_btn)
-
-        self.stop_btn = QPushButton("■  Stop")
-        self.stop_btn.setObjectName("danger")
-        self.stop_btn.clicked.connect(self._stop)
-        btn_row.addWidget(self.stop_btn)
-        root.addLayout(btn_row)
-
-        # DC direct voltage control
-        dc_row = QHBoxLayout()
-        dc_row.addWidget(QLabel("DC Voltage"))
-        self.dc_spin = QDoubleSpinBox()
-        self.dc_spin.setRange(DAC_VMIN, DAC_VMAX)
-        self.dc_spin.setValue(1.65)
-        self.dc_spin.setDecimals(3)
-        self.dc_spin.setSingleStep(0.05)
-        dc_row.addWidget(self.dc_spin, 1)
-        dc_btn = QPushButton("Set DC")
-        dc_btn.clicked.connect(self._set_dc)
-        dc_row.addWidget(dc_btn)
-        root.addLayout(dc_row)
-
-        # Connect preview updates
-        self.shape_combo.currentTextChanged.connect(self._update_preview)
-        self.freq_spin.valueChanged.connect(self._update_preview)
-        self.phase_spin.valueChanged.connect(self._update_preview)
-        self._update_preview()
-
-    def _update_preview(self):
-        shape = self.shape_combo.currentText().lower()
-        self.preview.set_wave(shape, self.freq_spin.value(), self.phase_spin.value())
-
-    def _apply(self):
-        shape = self.shape_combo.currentText().lower()
-        freq  = self.freq_spin.value()
-        amp   = self.amp_spin.value()
-        off   = self.offset_spin.value()
-        phase = self.phase_spin.value()
-        cmd = f"GEN {self.channel} {shape} {freq:.4f} {amp:.4f} {off:.4f} {phase:.2f}"
-        self.command_ready.emit(cmd)
-
-    def _stop(self):
-        # Stop only this channel by setting DC to current mid
-        self.command_ready.emit("STOP")
-
-    def _set_dc(self):
-        v = self.dc_spin.value()
-        cmd = f"GEN {self.channel} dc 0 0 {v:.4f} 0"
-        self.command_ready.emit(cmd)
-
-    def update_voltage(self, code: int):
-        v = DAC_VMIN + (DAC_VMAX - DAC_VMIN) * (code / 4095)
-        self.volt_label.setText(f"{v:.3f} V")
-
-    def set_enabled(self, enabled: bool):
-        self.apply_btn.setEnabled(enabled)
-        self.stop_btn.setEnabled(enabled)
-
-
-# ─────────────────────── Connection Bar ──────────────────────────────
-
-class ConnectionBar(QWidget):
-    connect_clicked    = Signal(str, int)
-    disconnect_clicked = Signal()
-    refresh_clicked    = Signal()
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        row = QHBoxLayout(self)
-        row.setContentsMargins(0, 0, 0, 0)
-
-        row.addWidget(QLabel("Port"))
-        self.port_combo = QComboBox()
-        self.port_combo.setMinimumWidth(180)
-        row.addWidget(self.port_combo)
-
-        row.addWidget(QLabel("Baud"))
-        self.baud_combo = QComboBox()
-        self.baud_combo.addItems(["115200", "57600", "9600"])
-        row.addWidget(self.baud_combo)
-
-        self.refresh_btn = QPushButton("↻")
-        self.refresh_btn.setFixedWidth(36)
-        self.refresh_btn.clicked.connect(self.refresh_clicked)
-        row.addWidget(self.refresh_btn)
-
-        self.connect_btn = QPushButton("Connect")
-        self.connect_btn.setObjectName("accent")
-        self.connect_btn.clicked.connect(self._connect)
-        row.addWidget(self.connect_btn)
-
-        self.disconnect_btn = QPushButton("Disconnect")
-        self.disconnect_btn.setObjectName("danger")
-        self.disconnect_btn.setEnabled(False)
-        self.disconnect_btn.clicked.connect(self.disconnect_clicked)
-        row.addWidget(self.disconnect_btn)
-
-        self.ping_btn = QPushButton("Ping")
-        self.ping_btn.setEnabled(False)
-        row.addWidget(self.ping_btn)
-
-        self.status_label = QLabel("● Disconnected")
-        self.status_label.setObjectName("status_err")
-        row.addWidget(self.status_label)
-
-        row.addStretch()
-        self.refresh_ports()
-
-    def refresh_ports(self):
-        self.port_combo.clear()
-        ports = [p.device for p in serial.tools.list_ports.comports()]
-        if ports:
-            self.port_combo.addItems(ports)
+        # Adaptive duration: show enough periods to see the full shape.
+        # At low frequencies keep ≥3 periods visible; cap total at 50 ms for high freqs.
+        if f_min > 0:
+            period = 1.0 / f_min
+            if period < 0.005:          # f > 200 Hz  → standard 2-period view, ≤50 ms
+                duration = min(2.0 * period, 0.05)
+            elif period < 0.05:         # 20–200 Hz   → show 3 periods
+                duration = 3.0 * period
+            else:                       # < 20 Hz     → show 4 periods, cap at 4 s
+                duration = min(4.0 * period, 4.0)
         else:
-            self.port_combo.addItem("(no ports)")
+            duration = 0.05
+        t = np.linspace(0, duration, max(int(sr * duration), 2000))
 
-    def _connect(self):
-        port = self.port_combo.currentText()
-        baud = int(self.baud_combo.currentText())
-        self.connect_clicked.emit(port, baud)
+        p1 = np.radians(p1_deg)
+        p2 = np.radians(p2_deg)
 
-    def set_connected(self, connected: bool):
-        self.connect_btn.setEnabled(not connected)
-        self.disconnect_btn.setEnabled(connected)
-        self.ping_btn.setEnabled(connected)
-        if connected:
-            self.status_label.setText("● Connected")
-            self.status_label.setObjectName("status_ok")
-        else:
-            self.status_label.setText("● Disconnected")
-            self.status_label.setObjectName("status_err")
-        # Force style refresh
-        self.status_label.style().unpolish(self.status_label)
-        self.status_label.style().polish(self.status_label)
+        denom = np.sin(np.pi * (f2 - f1) * t + np.pi / 2)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            env = np.where(np.abs(denom) < 1e-9,
+                           gain_max,
+                           np.clip(np.abs(1.0 / denom), 0, gain_max))
 
+        sines    = a1 * np.sin(2*np.pi*f1*t + p1) + a2 * np.sin(2*np.pi*f2*t + p2)
+        combined = np.clip(dc + env * sines, 0, 3.3)
+        t_ms     = t * 1000
 
-# ─────────────────── Quick Actions Bar ───────────────────────────────
+        self.ax.plot(t_ms, dc + a1*np.sin(2*np.pi*f1*t+p1),
+                     color=COLORS["sine1"], lw=0.8, alpha=0.35, label="Sine 1")
+        self.ax.plot(t_ms, dc + a2*np.sin(2*np.pi*f2*t+p2),
+                     color=COLORS["sine2"], lw=0.8, alpha=0.35, label="Sine 2")
 
-class QuickBar(QWidget):
-    command_ready = Signal(str)
+        env_top = np.clip(dc + env*(np.abs(a1)+np.abs(a2)), 0, 3.3)
+        env_bot = np.clip(dc - env*(np.abs(a1)+np.abs(a2)), 0, 3.3)
+        self.ax.fill_between(t_ms, env_bot, env_top, color=COLORS["combined"], alpha=0.07)
+        self.ax.plot(t_ms, env_top, color=COLORS["combined"], lw=0.6, alpha=0.4, ls="--")
+        self.ax.plot(t_ms, env_bot, color=COLORS["combined"], lw=0.6, alpha=0.4, ls="--")
+        self.ax.plot(t_ms, combined, color=COLORS["combined"], lw=1.6, label="Combined")
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        row = QHBoxLayout(self)
-        row.setContentsMargins(0, 0, 0, 0)
-
-        row.addWidget(QLabel("Quick:"))
-
-        zero_btn = QPushButton("Zero All")
-        zero_btn.setObjectName("danger")
-        zero_btn.clicked.connect(lambda: self.command_ready.emit("ZERO"))
-        row.addWidget(zero_btn)
-
-        mid_btn = QPushButton("Mid All")
-        mid_btn.clicked.connect(lambda: self.command_ready.emit("MID"))
-        row.addWidget(mid_btn)
-
-        stop_btn = QPushButton("Stop Waves")
-        stop_btn.clicked.connect(lambda: self.command_ready.emit("STOP"))
-        row.addWidget(stop_btn)
-
-        status_btn = QPushButton("Status")
-        status_btn.clicked.connect(lambda: self.command_ready.emit("STATUS"))
-        row.addWidget(status_btn)
-
-        row.addSpacing(20)
-        row.addWidget(QLabel("GEN2 Both →"))
-
-        self.shape0 = QComboBox()
-        self.shape0.addItems([s.capitalize() for s in SHAPES])
-        row.addWidget(self.shape0)
-
-        self.freq0 = QDoubleSpinBox()
-        self.freq0.setRange(0.01, 100)
-        self.freq0.setValue(1.0)
-        self.freq0.setSuffix(" Hz")
-        row.addWidget(self.freq0)
-
-        self.shape1 = QComboBox()
-        self.shape1.addItems([s.capitalize() for s in SHAPES])
-        self.shape1.setCurrentIndex(1)
-        row.addWidget(self.shape1)
-
-        self.freq1 = QDoubleSpinBox()
-        self.freq1.setRange(0.01, 100)
-        self.freq1.setValue(2.0)
-        self.freq1.setSuffix(" Hz")
-        row.addWidget(self.freq1)
-
-        gen2_btn = QPushButton("▶ GEN2")
-        gen2_btn.setObjectName("accent")
-        gen2_btn.clicked.connect(self._gen2)
-        row.addWidget(gen2_btn)
-
-        row.addStretch()
-
-    def _gen2(self):
-        s0 = self.shape0.currentText().lower()
-        f0 = self.freq0.value()
-        s1 = self.shape1.currentText().lower()
-        f1 = self.freq1.value()
-        cmd = f"GEN2 {s0} {f0:.4f} 1.0 1.65 0 {s1} {f1:.4f} 1.0 1.65 0"
-        self.command_ready.emit(cmd)
+        self.ax.axhline(3.3, color=COLORS["red"],    lw=0.5, ls="--", alpha=0.5)
+        self.ax.axhline(0,   color=COLORS["border"], lw=0.5, ls="--")
+        self.ax.legend(loc="upper right", fontsize=7,
+                       facecolor=COLORS["surface"], edgecolor=COLORS["border"],
+                       labelcolor=COLORS["text"])
+        self.ax.set_xlabel("time (ms)", fontsize=8)
+        self.ax.set_ylabel("Voltage (V)", fontsize=8)
+        self.ax.set_title(
+            f"peak {float(np.max(combined)):.3f} V  |  "
+            f"trough {float(np.min(combined)):.3f} V  |  gain cap ×{gain_max:.1f}",
+            fontsize=8, color=COLORS["text_dim"])
+        self.fig.tight_layout(pad=1.2)
+        self.draw()
 
 
-# ─────────────────────── Console Panel ───────────────────────────────
+# ── Debug telemetry canvas (scrolling voltage + envelope) ────────────────────
+class TelemetryCanvas(FigureCanvas):
+    """
+    Sliding-window telemetry chart using matplotlib blitting for low-overhead updates.
 
-class ConsolePanel(QWidget):
-    command_ready = Signal(str)
+    Strategy:
+    - Axes chrome (spines, ticks, labels, legends, static hlines) is drawn ONCE
+      and cached as a background bitmap via copy_from_bbox().
+    - On each new sample only the animated line artists are redrawn via blit(),
+      which avoids re-layouting the figure entirely.
+    - A pending-data queue fed from the serial thread is drained by a QTimer on
+      the GUI thread (no cross-thread canvas calls).
+    - The background is invalidated and redrawn whenever the widget is resized.
+    """
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        v = QVBoxLayout(self)
-        v.setSpacing(6)
+    WINDOW = 70          # visible sliding-window width (samples)
 
-        self.log = QTextEdit()
-        self.log.setReadOnly(True)
-        self.log.setMaximumHeight(220)
-        v.addWidget(self.log)
+    def __init__(self):
+        self.fig = Figure(figsize=(5, 2.2), facecolor=COLORS["bg"])
+        super().__init__(self.fig)
+        self.ax_v   = self.fig.add_subplot(211)
+        self.ax_env = self.fig.add_subplot(212)
 
-        cmd_row = QHBoxLayout()
-        self.cmd_input = QLineEdit()
-        self.cmd_input.setPlaceholderText("Type command and press Enter…")
-        self.cmd_input.returnPressed.connect(self._send_manual)
-        cmd_row.addWidget(self.cmd_input)
+        self._v_buf      = deque(maxlen=self.WINDOW)
+        self._env_buf    = deque(maxlen=self.WINDOW)
+        self._peak_buf   = deque(maxlen=self.WINDOW)
+        self._trough_buf = deque(maxlen=self.WINDOW)
 
-        send_btn = QPushButton("Send")
-        send_btn.clicked.connect(self._send_manual)
-        cmd_row.addWidget(send_btn)
+        # Pending data pushed from the drain thread; consumed by _flush_timer
+        self._pending: list[tuple] = []
+        self._pending_lock = threading.Lock()
 
-        clear_btn = QPushButton("Clear")
-        clear_btn.clicked.connect(self.log.clear)
-        cmd_row.addWidget(clear_btn)
+        self._bg_v   = None   # cached background bitmaps
+        self._bg_env = None
+        self._initialized = False
 
-        v.addLayout(cmd_row)
+        self.setMinimumHeight(160)
+        self._build_static_elements()
 
-    def _send_manual(self):
-        text = self.cmd_input.text().strip()
-        if text:
-            self.append_log(f"→ {text}", ACCENT_CYAN)
-            self.command_ready.emit(text)
-            self.cmd_input.clear()
+        # Flush pending data at ~20 Hz on the GUI thread
+        self._flush_timer = QTimer()
+        self._flush_timer.timeout.connect(self._flush_pending)
+        self._flush_timer.start(50)
 
-    def append_log(self, text: str, color: str = TEXT_MAIN):
-        self.log.setTextColor(QColor(color))
-        self.log.append(text)
-        self.log.setTextColor(QColor(TEXT_MAIN))
-        sb = self.log.verticalScrollBar()
-        sb.setValue(sb.maximum())
+    # ── Static chrome (drawn once) ────────────────────────────────────────────
+    def _build_static_elements(self):
+        """Draw all non-animated chrome and create the animated line objects."""
+        for ax in (self.ax_v, self.ax_env):
+            ax.set_facecolor(COLORS["surface"])
+            for sp in ax.spines.values():
+                sp.set_color(COLORS["border"])
+            ax.tick_params(colors=COLORS["text_dim"], labelsize=7)
+            ax.set_xlim(0, self.WINDOW - 1)
+
+        self.ax_v.set_ylim(-0.05, 3.45)
+        self.ax_v.set_ylabel("V", fontsize=7, color=COLORS["text_dim"])
+        self.ax_v.axhline(3.3, color=COLORS["red"], lw=0.4, ls=":", alpha=0.5)
+
+        self.ax_env.set_ylabel("gain", fontsize=7, color=COLORS["text_dim"])
+        self.ax_env.set_xlabel("samples (last 70)", fontsize=7, color=COLORS["text_dim"])
+
+        self.fig.tight_layout(pad=0.8, h_pad=0.4)
+
+        # Animated lines — created once, data updated in place
+        (self._line_v,)      = self.ax_v.plot([], [], color=COLORS["combined"],
+                                               lw=1.0, label="V_out", animated=True)
+        (self._line_peak,)   = self.ax_v.plot([], [], color=COLORS["red"],
+                                               lw=0.6, ls="--", alpha=0.6,
+                                               label="peak", animated=True)
+        (self._line_trough,) = self.ax_v.plot([], [], color=COLORS["sine1"],
+                                               lw=0.6, ls="--", alpha=0.6,
+                                               label="trough", animated=True)
+        (self._line_env,)    = self.ax_env.plot([], [], color=COLORS["sine2"],
+                                                 lw=1.0, label="envelope", animated=True)
+
+        # Static legends (non-animated, drawn as part of background)
+        self.ax_v.legend(loc="upper right", fontsize=6,
+                         facecolor=COLORS["surface"], edgecolor=COLORS["border"],
+                         labelcolor=COLORS["text"])
+        self.ax_env.legend(loc="upper right", fontsize=6,
+                           facecolor=COLORS["surface"], edgecolor=COLORS["border"],
+                           labelcolor=COLORS["text"])
+
+    def _cache_background(self):
+        """Full draw then snapshot the static background for blitting."""
+        self.draw()
+        self._bg_v   = self.copy_from_bbox(self.ax_v.bbox)
+        self._bg_env = self.copy_from_bbox(self.ax_env.bbox)
+        self._initialized = True
+
+    def resizeEvent(self, event):  # noqa: N802
+        super().resizeEvent(event)
+        # Invalidate cache so it gets rebuilt on next blit cycle
+        self._initialized = False
+
+    # ── Data ingestion (called from any thread) ───────────────────────────────
+    def push(self, v, env, peak, trough):
+        with self._pending_lock:
+            self._pending.append((v, env, peak, trough))
+
+    # ── GUI-thread flush ──────────────────────────────────────────────────────
+    def _flush_pending(self):
+        with self._pending_lock:
+            if not self._pending:
+                return
+            batch = self._pending
+            self._pending = []
+
+        for v, env, peak, trough in batch:
+            self._v_buf.append(v)
+            self._env_buf.append(env)
+            self._peak_buf.append(peak)
+            self._trough_buf.append(trough)
+
+        self._blit_update()
+
+    def _blit_update(self):
+        if not self._initialized:
+            self._cache_background()
+
+        x = list(range(len(self._v_buf)))
+
+        self._line_v.set_data(x, list(self._v_buf))
+        self._line_peak.set_data(x, list(self._peak_buf))
+        self._line_trough.set_data(x, list(self._trough_buf))
+        self._line_env.set_data(x, list(self._env_buf))
+
+        # Auto-scale env y-axis without full redraw
+        if self._env_buf:
+            env_max = max(self._env_buf)
+            self.ax_env.set_ylim(0, max(env_max * 1.15, 0.1))
+
+        # Restore static background, draw only the animated lines, blit
+        self.restore_region(self._bg_v)
+        self.ax_v.draw_artist(self._line_v)
+        self.ax_v.draw_artist(self._line_peak)
+        self.ax_v.draw_artist(self._line_trough)
+        self.blit(self.ax_v.bbox)
+
+        self.restore_region(self._bg_env)
+        self.ax_env.draw_artist(self._line_env)
+        self.blit(self.ax_env.bbox)
+
+    # ── Clear ─────────────────────────────────────────────────────────────────
+    def clear(self):
+        with self._pending_lock:
+            self._pending = []
+        self._v_buf.clear()
+        self._env_buf.clear()
+        self._peak_buf.clear()
+        self._trough_buf.clear()
+        self._initialized = False
+        self._cache_background()
 
 
-# ─────────────────────── Main Window ─────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def make_spinbox(min_val, max_val, decimals, step, value, suffix="") -> QDoubleSpinBox:
+    sb = QDoubleSpinBox()
+    sb.setRange(min_val, max_val)
+    sb.setDecimals(decimals)
+    sb.setSingleStep(step)
+    sb.setValue(value)
+    if suffix:
+        sb.setSuffix(f"  {suffix}")
+    return sb
 
+
+# ── Main window ───────────────────────────────────────────────────────────────
 class MainWindow(QMainWindow):
+    # Signal so serial thread can safely append text to the console
+    _console_append = Signal(str, str)   # (text, css_color)
+
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Arduino Due  ·  DAC Signal Generator")
-        self.setMinimumSize(1100, 700)
-
-        self.worker = SerialWorker()
-        self.worker.received.connect(self._on_received)
-        self.worker.connected.connect(self._on_connected)
-        self.worker.disconnected.connect(self._on_disconnected)
-        self.worker.error.connect(self._on_error)
-
+        self.setWindowTitle("Dual-Sine DAC Controller  //  Arduino Due  v3.0")
+        self.resize(1100, 760)
+        self.serial = SerialWorker()
+        self.serial.error_occurred.connect(self._on_serial_error)
+        self.serial.connected.connect(self._on_connected)
+        self.serial.message_received.connect(self._log_rx)
+        self._console_append.connect(self._append_console)
+        self._running = False
         self._build_ui()
 
+        # Preview refresh timer (4 fps — purely local math)
+        self._preview_timer = QTimer(self)
+        self._preview_timer.timeout.connect(self._refresh_preview)
+        self._preview_timer.start(250)
+
+        # Telemetry drain timer — poll serial for unsolicited debug JSON
+        self._drain_timer = QTimer(self)
+        self._drain_timer.timeout.connect(self._drain_serial)
+        self._drain_timer.start(50)   # 20 Hz poll
+
+        # Clip counters for stats panel
+        self._total_clip_hi = 0
+        self._total_clip_lo = 0
+
+    # ── UI construction ───────────────────────────────────────────────────────
     def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
-        main = QVBoxLayout(central)
-        main.setSpacing(10)
-        main.setContentsMargins(14, 14, 14, 10)
+        root = QHBoxLayout(central)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(12)
 
-        # ── Header ──────────────────────────────────────────
-        hdr = QHBoxLayout()
-        title_block = QVBoxLayout()
-        title = QLabel("DAC CONTROLLER")
-        title.setObjectName("title")
-        subtitle = QLabel("Arduino Due  ·  12-bit  ·  Dual Channel")
-        subtitle.setObjectName("subtitle")
-        title_block.addWidget(title)
-        title_block.addWidget(subtitle)
-        hdr.addLayout(title_block)
-        hdr.addStretch()
-        main.addLayout(hdr)
+        # Left panel
+        left = QVBoxLayout()
+        left.setSpacing(10)
+        left.addWidget(self._build_connection_box())
+        left.addWidget(self._build_sine_box("SINE  1", "1", COLORS["sine1"]))
+        left.addWidget(self._build_sine_box("SINE  2", "2", COLORS["sine2"]))
+        left.addWidget(self._build_global_box())
+        left.addWidget(self._build_transport_box())
+        left.addStretch()
 
-        # ── Connection bar ───────────────────────────────────
-        self.conn_bar = ConnectionBar()
-        self.conn_bar.connect_clicked.connect(self._connect)
-        self.conn_bar.disconnect_clicked.connect(self._disconnect)
-        self.conn_bar.refresh_clicked.connect(self.conn_bar.refresh_ports)
-        self.conn_bar.ping_btn.clicked.connect(lambda: self._send("PING"))
-        main.addWidget(self.conn_bar)
+        left_w = QWidget(); left_w.setLayout(left); left_w.setFixedWidth(360)
 
-        sep = QFrame()
-        sep.setFrameShape(QFrame.HLine)
-        sep.setObjectName("sep")
-        main.addWidget(sep)
+        # Right panel: tabbed (Preview / Debug)
+        right = QVBoxLayout()
+        right.setSpacing(8)
 
-        # ── Quick bar ────────────────────────────────────────
-        self.quick_bar = QuickBar()
-        self.quick_bar.command_ready.connect(self._send)
-        main.addWidget(self.quick_bar)
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._build_preview_tab(), "PREVIEW")
+        self.tabs.addTab(self._build_debug_tab(),   "DEBUG  CONSOLE")
 
-        sep2 = QFrame()
-        sep2.setFrameShape(QFrame.HLine)
-        sep2.setObjectName("sep")
-        main.addWidget(sep2)
+        right.addWidget(self.tabs, 1)
+        self._build_stats_panel(right)
 
-        # ── Channel panels ───────────────────────────────────
-        channels_row = QHBoxLayout()
-        self.ch0 = ChannelPanel(0, ACCENT_CYAN)
-        self.ch0.command_ready.connect(self._send)
-        self.ch1 = ChannelPanel(1, ACCENT_GREEN)
-        self.ch1.command_ready.connect(self._send)
-        channels_row.addWidget(self.ch0)
-        channels_row.addWidget(self.ch1)
-        main.addLayout(channels_row)
+        right_w = QWidget(); right_w.setLayout(right)
 
-        sep3 = QFrame()
-        sep3.setFrameShape(QFrame.HLine)
-        sep3.setObjectName("sep")
-        main.addWidget(sep3)
+        root.addWidget(left_w)
+        root.addWidget(right_w, 1)
 
-        # ── Console ──────────────────────────────────────────
-        console_box = QGroupBox("Console  ·  Serial Log")
-        cb_layout = QVBoxLayout(console_box)
-        self.console = ConsolePanel()
-        self.console.command_ready.connect(self._send)
-        cb_layout.addWidget(self.console)
-        main.addWidget(console_box)
-
-        # Status bar
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
-        self.status_bar.showMessage("Not connected  ·  Select a COM port and click Connect")
-
-        self._set_controls_enabled(False)
-
-    # ── Connection ──────────────────────────────────────────
-
-    def _connect(self, port: str, baud: int):
-        self.console.append_log(f"→ Connecting to {port} @ {baud}…", ACCENT_AMBER)
-        self.worker.open(port, baud)
-
-    def _disconnect(self):
-        self.worker.close()
-
-    @Slot()
-    def _on_connected(self):
-        self.conn_bar.set_connected(True)
-        self.status_bar.showMessage("Connected  ·  Sending PING…")
-        self.console.append_log("● Connected", ACCENT_GREEN)
-        self._set_controls_enabled(True)
-        QTimer.singleShot(200, lambda: self._send("PING"))
-
-    @Slot()
-    def _on_disconnected(self):
-        self.conn_bar.set_connected(False)
         self.status_bar.showMessage("Disconnected")
-        self.console.append_log("● Disconnected", ACCENT_RED)
-        self._set_controls_enabled(False)
 
-    @Slot(str)
-    def _on_error(self, msg: str):
-        self.console.append_log(f"✖ Error: {msg}", ACCENT_RED)
-        self.status_bar.showMessage(f"Error: {msg}")
+    def _build_preview_tab(self) -> QWidget:
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(4, 4, 4, 4)
+        lbl = QLabel("WAVEFORM  PREVIEW")
+        lbl.setObjectName("section_label")
+        v.addWidget(lbl)
+        self.canvas = WaveformCanvas()
+        v.addWidget(self.canvas, 1)
+        return w
 
-    # ── Send / Receive ──────────────────────────────────────
+    def _build_debug_tab(self) -> QWidget:
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(4, 4, 4, 4)
+        v.setSpacing(6)
 
-    def _send(self, cmd: str):
-        if self.worker.is_open:
-            self.worker.send(cmd)
-            self.console.append_log(f"→ {cmd}", ACCENT_CYAN)
+        # ── Telemetry chart ───────────────────────────────────────────────────
+        telem_label = QLabel("LIVE  TELEMETRY  (from board, ~10 Hz)")
+        telem_label.setObjectName("section_label")
+        v.addWidget(telem_label)
+
+        self.telem_canvas = TelemetryCanvas()
+        v.addWidget(self.telem_canvas)
+
+        # ── Debug stats bar ───────────────────────────────────────────────────
+        stats_frame = QFrame()
+        stats_frame.setStyleSheet(
+            f"QFrame {{ background:{COLORS['surface']}; border:1px solid {COLORS['border']};"
+            f"border-radius:4px; }}")
+        sg = QGridLayout(stats_frame)
+        sg.setContentsMargins(10, 6, 10, 6)
+        sg.setHorizontalSpacing(20)
+
+        def dstat(label, attr, col):
+            lb = QLabel(label)
+            lb.setStyleSheet(f"color:{COLORS['text_dim']};font-size:10px;letter-spacing:1px;")
+            vl = QLabel("—")
+            vl.setStyleSheet(f"color:{COLORS['text']};font-family:'JetBrains Mono';font-size:11px;")
+            setattr(self, attr, vl)
+            sg.addWidget(lb, 0, col)
+            sg.addWidget(vl, 1, col)
+
+        dstat("ISR µs",   "dstat_isr",     0)
+        dstat("CLIP ↑",   "dstat_cliphi",  1)
+        dstat("CLIP ↓",   "dstat_cliplo",  2)
+        dstat("SAMPLES",  "dstat_samps",   3)
+        dstat("ENV GAIN", "dstat_env",     4)
+        v.addWidget(stats_frame)
+
+        # ── Raw serial log ────────────────────────────────────────────────────
+        log_header = QHBoxLayout()
+        log_lbl = QLabel("SERIAL  LOG")
+        log_lbl.setObjectName("section_label")
+        log_header.addWidget(log_lbl)
+        log_header.addStretch()
+
+        self.dbg_checkbox = QCheckBox("Board telemetry (DBG ON)")
+        self.dbg_checkbox.setChecked(False)
+        self.dbg_checkbox.toggled.connect(self._toggle_dbg)
+        log_header.addWidget(self.dbg_checkbox)
+
+        self.autoscroll_cb = QCheckBox("Auto-scroll")
+        self.autoscroll_cb.setChecked(True)
+        log_header.addWidget(self.autoscroll_cb)
+
+        clear_btn = QPushButton("CLEAR")
+        clear_btn.setObjectName("clear_btn")
+        clear_btn.clicked.connect(self._clear_console)
+        log_header.addWidget(clear_btn)
+        v.addLayout(log_header)
+
+        self.console = QTextEdit()
+        self.console.setReadOnly(True)
+        self.console.setMinimumHeight(120)
+        v.addWidget(self.console, 1)
+
+        # Manual command input
+        cmd_row = QHBoxLayout()
+        self.cmd_input = QLineEdit()
+        self.cmd_input.setPlaceholderText("Send raw command, e.g.  STATUS  or  DBG ON")
+        self.cmd_input.returnPressed.connect(self._send_manual_cmd)
+        cmd_row.addWidget(self.cmd_input, 1)
+        send_btn = QPushButton("SEND")
+        send_btn.setFixedWidth(64)
+        send_btn.clicked.connect(self._send_manual_cmd)
+        cmd_row.addWidget(send_btn)
+        v.addLayout(cmd_row)
+
+        return w
+
+    def _build_connection_box(self) -> QGroupBox:
+        box = QGroupBox("CONNECTION")
+        lay = QHBoxLayout(box)
+        lay.setSpacing(6)
+
+        self.port_combo = QComboBox()
+        self._refresh_ports()
+        lay.addWidget(self.port_combo)
+
+        refresh_btn = QPushButton("⟳")
+        refresh_btn.setFixedWidth(32)
+        refresh_btn.clicked.connect(self._refresh_ports)
+        lay.addWidget(refresh_btn)
+
+        self.connect_btn = QPushButton("CONNECT")
+        self.connect_btn.setObjectName("connect_btn")
+        self.connect_btn.clicked.connect(self._toggle_connect)
+        lay.addWidget(self.connect_btn)
+        return box
+
+    def _build_sine_box(self, title: str, idx: str, color: str) -> QGroupBox:
+        box = QGroupBox(title)
+        box.setStyleSheet(f"QGroupBox {{ border-color: {color}44; }}")
+        grid = QGridLayout(box)
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(6)
+
+        def row(label, widget):
+            r = grid.rowCount()
+            lbl = QLabel(label)
+            lbl.setStyleSheet(f"color:{COLORS['text_dim']};font-size:14px;background-color:transparent;")
+            grid.addWidget(lbl, r, 0)
+            grid.addWidget(widget, r, 1)
+
+        if idx == "1":
+            self.amp1   = make_spinbox(0, 1.65,  3, 0.05,  0.5,   "V")
+            self.freq1  = make_spinbox(0, 5000,  2, 10.0,  100.0, "Hz")
+            self.phase1 = make_spinbox(-360, 360, 1, 5.0,  0.0,   "°")
+            for c in (self.amp1, self.freq1, self.phase1):
+                c.valueChanged.connect(self._param_changed)
+            row("Amplitude", self.amp1)
+            row("Frequency", self.freq1)
+            row("Phase",     self.phase1)
         else:
-            self.console.append_log("✖ Not connected", ACCENT_RED)
+            self.amp2   = make_spinbox(0, 1.65,  3, 0.05,  0.5,   "V")
+            self.freq2  = make_spinbox(0, 5000,  2, 10.0,  200.0, "Hz")
+            self.phase2 = make_spinbox(-360, 360, 1, 5.0,  0.0,   "°")
+            for c in (self.amp2, self.freq2, self.phase2):
+                c.valueChanged.connect(self._param_changed)
+            row("Amplitude", self.amp2)
+            row("Frequency", self.freq2)
+            row("Phase",     self.phase2)
+        return box
+
+    def _build_global_box(self) -> QGroupBox:
+        box = QGroupBox("GLOBAL")
+        grid = QGridLayout(box)
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(6)
+
+        def row(label, widget):
+            r = grid.rowCount()
+            lbl = QLabel(label)
+            lbl.setStyleSheet(f"color:{COLORS['text_dim']};font-size:14px;background-color:transparent;")
+            grid.addWidget(lbl, r, 0)
+            grid.addWidget(widget, r, 1)
+
+        self.dc_offset   = make_spinbox(0, 3.3,   3, 0.05, 1.65,  "V")
+        self.sample_rate = QSpinBox()
+        self.sample_rate.setRange(100, 100000)
+        self.sample_rate.setValue(10000)
+        self.sample_rate.setSuffix("  Hz")
+        self.sample_rate.setSingleStep(1000)
+        self.gain_max    = make_spinbox(1.0, 20.0, 1, 0.5,  4.0,  "×")
+
+        for c in (self.dc_offset, self.sample_rate, self.gain_max):
+            c.valueChanged.connect(self._param_changed)
+
+        row("DC Offset",   self.dc_offset)
+        row("Sample Rate", self.sample_rate)
+        row("Max Env Gain", self.gain_max)
+
+        self.clip_label = QLabel("")
+        self.clip_label.setStyleSheet(f"color:{COLORS['red']};font-size:10px;background-color:transparent;")
+        grid.addWidget(self.clip_label, grid.rowCount(), 0, 1, 3)
+        return box
+
+    def _build_transport_box(self) -> QGroupBox:
+        box = QGroupBox("TRANSPORT")
+        lay = QHBoxLayout(box)
+        lay.setSpacing(8)
+
+        self.apply_btn = QPushButton("APPLY")
+        self.apply_btn.clicked.connect(self._apply_all)
+        self.apply_btn.setEnabled(False)
+
+        self.start_btn = QPushButton("▶  START")
+        self.start_btn.setObjectName("start_btn")
+        self.start_btn.clicked.connect(self._start)
+        self.start_btn.setEnabled(False)
+
+        self.stop_btn = QPushButton("■  STOP")
+        self.stop_btn.setObjectName("stop_btn")
+        self.stop_btn.clicked.connect(self._stop)
+        self.stop_btn.setEnabled(False)
+
+        lay.addWidget(self.apply_btn)
+        lay.addWidget(self.start_btn)
+        lay.addWidget(self.stop_btn)
+        return box
+
+    def _build_stats_panel(self, layout: QVBoxLayout):
+        frame = QFrame()
+        frame.setStyleSheet(
+            f"QFrame {{ background:{COLORS['surface']}; border:1px solid {COLORS['border']};"
+            f"border-radius:6px; }}")
+        grid = QGridLayout(frame)
+        grid.setContentsMargins(12, 8, 12, 8)
+        grid.setHorizontalSpacing(24)
+
+        def stat(label, attr, col):
+            lb = QLabel(label)
+            lb.setStyleSheet(f"color:{COLORS['text_dim']};font-size:10px;letter-spacing:1px;")
+            vl = QLabel("—")
+            vl.setStyleSheet(f"color:{COLORS['text']};font-family:'JetBrains Mono';font-size:12px;")
+            setattr(self, attr, vl)
+            grid.addWidget(lb, 0, col)
+            grid.addWidget(vl, 1, col)
+
+        stat("PEAK",    "stat_peak",    0)
+        stat("TROUGH",  "stat_trough",  1)
+        stat("VRANGE",  "stat_range",   2)
+        stat("NYQUIST", "stat_nyquist", 3)
+        layout.addWidget(frame)
+
+    # ── Port helpers ──────────────────────────────────────────────────────────
+    def _refresh_ports(self):
+        self.port_combo.clear()
+        ports = serial.tools.list_ports.comports()
+        for p in ports:
+            self.port_combo.addItem(p.device)
+        if not ports:
+            self.port_combo.addItem("(no ports found)")
+
+    def _get_params(self) -> dict:
+        return {
+            "a1": self.amp1.value(),   "f1": self.freq1.value(),
+            "p1": self.phase1.value(), "a2": self.amp2.value(),
+            "f2": self.freq2.value(),  "p2": self.phase2.value(),
+            "dc": self.dc_offset.value(),
+            "sr": self.sample_rate.value(),
+            "gain_max": self.gain_max.value(),
+        }
+
+    def _check_clipping(self, p: dict) -> str:
+        g = p["gain_max"]
+        hi = p["dc"] + g * (p["a1"] + p["a2"])
+        lo = p["dc"] - g * (p["a1"] + p["a2"])
+        w = []
+        if hi > 3.3: w.append(f"⚠ peak up to +{hi:.3f} V (clamped)")
+        if lo < 0.0: w.append(f"⚠ trough down to {lo:.3f} V (clamped)")
+        return "  ".join(w)
+
+    # ── Preview refresh ───────────────────────────────────────────────────────
+    def _refresh_preview(self):
+        p = self._get_params()
+        self.clip_label.setText(self._check_clipping(p))
+        self.canvas.update_plot(
+            a1=p["a1"], f1=p["f1"], p1_deg=p["p1"],
+            a2=p["a2"], f2=p["f2"], p2_deg=p["p2"],
+            dc=p["dc"], sr=p["sr"], gain_max=p["gain_max"])
+
+        t = np.linspace(0, 0.1, 50000)
+        denom = np.sin(np.pi * (p["f2"] - p["f1"]) * t + np.pi / 2)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            env = np.where(np.abs(denom) < 1e-9, p["gain_max"],
+                           np.clip(np.abs(1.0 / denom), 0, p["gain_max"]))
+        s = np.clip(p["dc"] + env * (
+            p["a1"] * np.sin(2*np.pi*p["f1"]*t + np.radians(p["p1"])) +
+            p["a2"] * np.sin(2*np.pi*p["f2"]*t + np.radians(p["p2"]))), 0, 3.3)
+
+        self.stat_peak.setText(f"{np.max(s):.3f} V")
+        self.stat_trough.setText(f"{np.min(s):.3f} V")
+        self.stat_range.setText(f"{np.max(s)-np.min(s):.3f} V")
+        self.stat_nyquist.setText(f"{p['sr']/2:.0f} Hz")
+
+    # ── Serial telemetry drain (20 Hz) ────────────────────────────────────────
+    def _drain_serial(self):
+        for raw in self.serial.drain():
+            self._process_incoming(raw)
+
+    def _process_incoming(self, raw: str):
+        """Route an unsolicited line to the console and/or telemetry chart."""
+        try:
+            d = json.loads(raw)
+        except json.JSONDecodeError:
+            self._log(raw, COLORS["text_dim"])
+            return
+
+        if d.get("dbg"):
+            # Update live telemetry chart
+            self.telem_canvas.push(
+                v      = float(d.get("v",      0)),
+                env    = float(d.get("env",    0)),
+                peak   = float(d.get("peak",   0)),
+                trough = float(d.get("trough", 0)),
+            )
+            # Update debug stat labels
+            self._total_clip_hi += int(d.get("clipHi", 0))
+            self._total_clip_lo += int(d.get("clipLo", 0))
+            self.dstat_isr.setText(f"{d.get('isrUs', '?')} µs")
+            self.dstat_cliphi.setText(str(self._total_clip_hi))
+            self.dstat_cliplo.setText(str(self._total_clip_lo))
+            self.dstat_samps.setText(str(d.get("samps", "?")))
+            self.dstat_env.setText(f"{float(d.get('env', 0)):.3f}")
+
+            # Highlight clips in red if nonzero this window
+            clip_color = COLORS["red"] if (d.get("clipHi", 0) or d.get("clipLo", 0)) \
+                         else COLORS["text_dim"]
+            for lbl in (self.dstat_cliphi, self.dstat_cliplo):
+                lbl.setStyleSheet(f"color:{clip_color};font-family:'JetBrains Mono';font-size:11px;")
+
+            # Log to console with compact format
+            self._log(
+                f"[DBG] V={d['v']:.3f}V  env={d['env']:.3f}  "
+                f"peak={d['peak']:.3f}  trough={d['trough']:.3f}  "
+                f"clip↑={d['clipHi']}  clip↓={d['clipLo']}  "
+                f"ISR={d['isrUs']}µs  n={d['samps']}",
+                COLORS["text_dim"])
+
+        elif d.get("status"):
+            self._log(f"[STATUS] {json.dumps(d)}", COLORS["accent"])
+        else:
+            self._log(f"[JSON] {raw}", COLORS["text_dim"])
+
+    # ── Console helpers ───────────────────────────────────────────────────────
+    def _log(self, text: str, color: str = COLORS["text"]):
+        ts = time.strftime("%H:%M:%S")
+        self._console_append.emit(f"[{ts}] {text}", color)
+
+    def _log_rx(self, text: str):
+        # Fired by SerialWorker.message_received (responses to commands we sent)
+        self._log(text, COLORS["green"])
+
+    @Slot(str, str)
+    def _append_console(self, text: str, color: str):
+        cursor = self.console.textCursor()
+
+        # Sliding window: trim oldest lines when over 70
+        doc = self.console.document()
+        if doc.blockCount() >= 70:
+            trim_cursor = QTextCursor(doc.begin())
+            trim_cursor.select(QTextCursor.BlockUnderCursor)
+            trim_cursor.movePosition(QTextCursor.EndOfBlock, QTextCursor.KeepAnchor)
+            trim_cursor.movePosition(QTextCursor.NextCharacter, QTextCursor.KeepAnchor)
+            trim_cursor.removeSelectedText()
+
+        cursor.movePosition(QTextCursor.End)
+        fmt = cursor.charFormat()
+        fmt.setForeground(QColor(color))
+        cursor.setCharFormat(fmt)
+        cursor.insertText(text + "\n")
+        if self.autoscroll_cb.isChecked():
+            self.console.setTextCursor(cursor)
+            self.console.ensureCursorVisible()
+
+    def _clear_console(self):
+        self.console.clear()
+        self.telem_canvas.clear()
+        self._total_clip_hi = 0
+        self._total_clip_lo = 0
+        for attr in ("dstat_isr", "dstat_cliphi", "dstat_cliplo",
+                     "dstat_samps", "dstat_env"):
+            getattr(self, attr).setText("—")
+
+    def _send_manual_cmd(self):
+        cmd = self.cmd_input.text().strip()
+        if not cmd:
+            return
+        self._log(f"→ {cmd}", COLORS["accent2"])
+        resp = self._send(cmd)
+        if resp is None:
+            self._log("(no response / not connected)", COLORS["red"])
+        self.cmd_input.clear()
+
+    def _toggle_dbg(self, enabled: bool):
+        cmd = "DBG ON" if enabled else "DBG OFF"
+        self._log(f"→ {cmd}", COLORS["accent2"])
+        resp = self._send(cmd)
+        if resp and "OK" in resp:
+            if not enabled:
+                self.telem_canvas.clear()
+
+    # ── Serial actions ────────────────────────────────────────────────────────
+    def _toggle_connect(self):
+        if self.serial.is_open:
+            self._stop()
+            self.serial.close()
+            self._log("Disconnected.", COLORS["text_dim"])
+        else:
+            port = self.port_combo.currentText()
+            if port and "no ports" not in port:
+                self.status_bar.showMessage(f"Connecting to {port} …")
+                self._log(f"Connecting to {port} @ 115200 …", COLORS["accent"])
+                ok = self.serial.open(port)
+                if ok:
+                    self.status_bar.showMessage(f"Connected  ·  {port}  @  115200 baud")
+                    self._log(f"Connected to {port}.", COLORS["green"])
+
+    def _param_changed(self):
+        pass   # preview updates via timer; board updated only on APPLY
+
+    def _send(self, cmd: str) -> str | None:
+        resp = self.serial.send(cmd)
+        if resp:
+            self.status_bar.showMessage(f"← {resp}")
+        return resp
+
+    def _apply_all(self):
+        if not self.serial.is_open:
+            return
+        p = self._get_params()
+        cmds = [
+            f"SET A1 {p['a1']:.4f}", f"SET F1 {p['f1']:.4f}",
+            f"SET P1 {p['p1']:.2f}", f"SET A2 {p['a2']:.4f}",
+            f"SET F2 {p['f2']:.4f}", f"SET P2 {p['p2']:.2f}",
+            f"SET DC {p['dc']:.4f}", f"SET GM {p['gain_max']:.2f}",
+            f"SET SR {int(p['sr'])}",
+        ]
+        self._log("Applying parameters…", COLORS["accent"])
+        for cmd in cmds:
+            self._log(f"  → {cmd}", COLORS["accent2"])
+            self._send(cmd)
+        self.status_bar.showMessage("Parameters applied.")
+        self._log("Parameters applied.", COLORS["green"])
+
+    def _start(self):
+        self._apply_all()
+        time.sleep(0.05)   # let Due finish ACKing all SET commands
+        self._log("→ START", COLORS["green"])
+        resp = self._send("START")
+        if resp and "OK" in resp:
+            self._running = True
+            self.start_btn.setEnabled(False)
+            self.stop_btn.setEnabled(True)
+            self.status_bar.showMessage("▶ Running")
+            self._log("▶ Running", COLORS["green"])
+            # Auto-enable debug telemetry if checkbox is on
+            if self.dbg_checkbox.isChecked():
+                self._send("DBG ON")
+
+    def _stop(self):
+        self._log("→ STOP", COLORS["red"])
+        resp = self._send("STOP")
+        self._running = False
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self.status_bar.showMessage("■ Stopped")
+        self._log("■ Stopped", COLORS["red"])
+        if self.dbg_checkbox.isChecked():
+            self._send("DBG OFF")
+
+    # ── Connected slot ────────────────────────────────────────────────────────
+    @Slot(bool)
+    def _on_connected(self, connected: bool):
+        if connected:
+            self.connect_btn.setText("DISCONNECT")
+            self.apply_btn.setEnabled(True)
+            self.start_btn.setEnabled(True)
+            self.stop_btn.setEnabled(False)
+        else:
+            self.connect_btn.setText("CONNECT")
+            self.apply_btn.setEnabled(False)
+            self.start_btn.setEnabled(False)
+            self.stop_btn.setEnabled(False)
+            self._running = False
 
     @Slot(str)
-    def _on_received(self, line: str):
-        self.console.append_log(f"← {line}", TEXT_MAIN)
-        try:
-            data = json.loads(line)
-            t = data.get("type", "")
-
-            if t == "pong":
-                self.status_bar.showMessage(
-                    f"Connected  ·  {data.get('board','?')}  ·  "
-                    f"{data.get('dac_bits','?')}-bit DAC  ·  "
-                    f"{data.get('dac_vmin','?')}…{data.get('dac_vmax','?')} V"
-                )
-
-            elif t == "status":
-                self.ch0.update_voltage(data.get("dac0_code", 0))
-                self.ch1.update_voltage(data.get("dac1_code", 0))
-
-            elif t == "set":
-                self.ch0.update_voltage(data.get("dac0", 0))
-                self.ch1.update_voltage(data.get("dac1", 0))
-
-            elif t == "wave":
-                ch = data.get("channel", {})
-                dac = ch.get("dac", -1)
-                code = ch.get("low_code", 0)
-                if dac == 0:
-                    self.ch0.update_voltage(code)
-                elif dac == 1:
-                    self.ch1.update_voltage(code)
-
-            elif t == "error":
-                self.status_bar.showMessage(f"Arduino error: {data.get('message','?')}")
-
-        except json.JSONDecodeError:
-            pass  # raw non-JSON line, already shown in console
-
-    # ── Helpers ─────────────────────────────────────────────
-
-    def _set_controls_enabled(self, enabled: bool):
-        self.ch0.set_enabled(enabled)
-        self.ch1.set_enabled(enabled)
+    def _on_serial_error(self, msg: str):
+        self.status_bar.showMessage(f"Serial error: {msg}")
+        self._log(f"Serial error: {msg}", COLORS["red"])
 
     def closeEvent(self, event):
-        self.worker.close()
+        if self.serial.is_open:
+            self._send("DBG OFF")
+        self._stop()
+        self.serial.close()
         super().closeEvent(event)
 
 
-# ─────────────────────── Entry Point ─────────────────────────────────
-
+# ── Entry point ───────────────────────────────────────────────────────────────
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
-    app.setStyleSheet(STYLESHEET)
+
+    palette = QPalette()
+    palette.setColor(QPalette.Window,          QColor(COLORS["bg"]))
+    palette.setColor(QPalette.WindowText,      QColor(COLORS["text"]))
+    palette.setColor(QPalette.Base,            QColor(COLORS["surface"]))
+    palette.setColor(QPalette.AlternateBase,   QColor(COLORS["surface2"]))
+    palette.setColor(QPalette.Text,            QColor(COLORS["text"]))
+    palette.setColor(QPalette.Button,          QColor(COLORS["surface2"]))
+    palette.setColor(QPalette.ButtonText,      QColor(COLORS["text"]))
+    palette.setColor(QPalette.Highlight,       QColor(COLORS["accent"]))
+    palette.setColor(QPalette.HighlightedText, QColor(COLORS["bg"]))
+    app.setPalette(palette)
+    app.setStyleSheet(STYLE)
+
     win = MainWindow()
     win.show()
     sys.exit(app.exec())

@@ -869,8 +869,8 @@ class MainWindow(QMainWindow):
 
         self.dc_offset = make_spinbox(0, 3.3, 3, 0.05, 1.65, "V")
         self.sample_rate = QSpinBox()
-        self.sample_rate.setRange(100, 100000)
-        self.sample_rate.setValue(10000)
+        self.sample_rate.setRange(100, 10000)
+        self.sample_rate.setValue(1000)
         self.sample_rate.setSuffix("  Hz")
         self.sample_rate.setSingleStep(1000)
         self.gain_max = make_spinbox(1.0, 20.0, 1, 0.5, 4.0, "×")

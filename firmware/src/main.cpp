@@ -69,7 +69,7 @@ void TC6_Handler(void) {
     TC_GetStatus(TC2, 0);   // clear interrupt flag
 
     if (!g_running) {
-        analogWrite(DAC0, 0);
+        dacc_write_conversion_data(DACC, 1);
         return;
     }
 
@@ -90,8 +90,7 @@ void TC6_Handler(void) {
     float sines = g_amp1 * sinf(TWO_PI * g_freq1 * t + g_phase1)
                 + g_amp2 * sinf(TWO_PI * g_freq2 * t + g_phase2);
 
-    //float v = g_dc + envelope * sines;
-    float v = g_dc + sines;
+    float v = g_dc + envelope * sines;
 
     // Clamp to safe DAC range
     if (v < 0.0f)      v = 0.0f;
@@ -100,8 +99,7 @@ void TC6_Handler(void) {
     uint16_t dac_val = (uint16_t)((v / DAC_VREF) * DAC_BITS + 0.5f);
     if (dac_val > DAC_BITS) dac_val = DAC_BITS;
 
-    //analogWrite(DAC0, 9999999);
-    dacc_write_conversion_data(DACC_INTERFACE, 99999);
+    dacc_write_conversion_data(DACC, dac_val);
 }
 
 // ── Timer setup ──────────────────────────────────────────────────────────────
@@ -169,7 +167,7 @@ void processCommand(const char* cmd) {
 
     if (strncmp(cmd, "STOP", 4) == 0) {
         g_running = false;
-        analogWrite(DAC0, 0);
+        dacc_write_conversion_data(DACC, 0);
         Serial.println("OK STOP");
         return;
     }
@@ -253,7 +251,16 @@ void setup() {
     while (!Serial);            // wait for USB CDC
 
     analogWriteResolution(12);  // 12-bit DAC on Due
-    analogWrite(DAC0, 0);
+
+    pmc_enable_periph_clk(ID_DACC);
+    DACC->DACC_CR   = DACC_CR_SWRST;
+    DACC->DACC_MR   = DACC_MR_TRGEN_DIS          // free-running (SW trigger)
+                    | DACC_MR_WORD_HALF           // 16-bit half-word transfers
+                    | DACC_MR_REFRESH(1)
+                    | DACC_MR_STARTUP_8           // 8-period startup
+                    | DACC_MR_MAXS;              // max speed mode
+    dacc_set_channel_selection(DACC, 1);         // DAC1 = channel 1
+    dacc_enable_channel(DACC, 1);
 
     setupTimer(g_sampleRate);
 

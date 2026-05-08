@@ -201,6 +201,7 @@ class SerialWorker(QObject):
             if not self._port or not self._port.is_open:
                 return None
             try:
+                self._port.reset_input_buffer()  # ← flush stale responses
                 self._port.write((cmd.strip() + "\n").encode())
                 deadline = time.time() + 0.3
                 while time.time() < deadline:
@@ -638,6 +639,7 @@ class MainWindow(QMainWindow):
 
     def _start(self):
         self._apply_all()
+        time.sleep(0.05)
         resp = self._send("START")
         if resp and "OK" in resp:
             self._running = True

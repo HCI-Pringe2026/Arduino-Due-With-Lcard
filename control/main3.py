@@ -117,18 +117,34 @@ QPushButton:hover {{
     border-color: {COLORS['accent']};
     color: {COLORS['accent']};
 }}
+QPushButton:disabled {{
+    background-color: {COLORS['surface']};
+    border-color: {COLORS['border']};
+    color: {COLORS['text_dim']};
+    opacity: 0.4;
+}}
 QPushButton#start_btn {{
     background-color: #163a20;
     border-color: {COLORS['green']};
     color: {COLORS['green']};
 }}
 QPushButton#start_btn:hover {{ background-color: #1e4d29; }}
+QPushButton#start_btn:disabled {{
+    background-color: {COLORS['surface']};
+    border-color: {COLORS['border']};
+    color: {COLORS['text_dim']};
+}}
 QPushButton#stop_btn {{
     background-color: #3a1616;
     border-color: {COLORS['red']};
     color: {COLORS['red']};
 }}
 QPushButton#stop_btn:hover {{ background-color: #4d1e1e; }}
+QPushButton#stop_btn:disabled {{
+    background-color: {COLORS['surface']};
+    border-color: {COLORS['border']};
+    color: {COLORS['text_dim']};
+}}
 QPushButton#connect_btn {{
     background-color: #162a3a;
     border-color: {COLORS['accent']};
@@ -309,7 +325,19 @@ class WaveformCanvas(FigureCanvas):
         self._style_axes()
 
         f_min    = min(f1, f2) if min(f1, f2) > 0 else max(f1, f2)
-        duration = min(2.0 / f_min if f_min > 0 else 0.05, 0.05)
+
+        # Adaptive duration: show enough periods to see the full shape.
+        # At low frequencies keep ≥3 periods visible; cap total at 50 ms for high freqs.
+        if f_min > 0:
+            period = 1.0 / f_min
+            if period < 0.005:          # f > 200 Hz  → standard 2-period view, ≤50 ms
+                duration = min(2.0 * period, 0.05)
+            elif period < 0.05:         # 20–200 Hz   → show 3 periods
+                duration = 3.0 * period
+            else:                       # < 20 Hz     → show 4 periods, cap at 4 s
+                duration = min(4.0 * period, 4.0)
+        else:
+            duration = 0.05
         t = np.linspace(0, duration, max(int(sr * duration), 2000))
 
         p1 = np.radians(p1_deg)
@@ -844,6 +872,16 @@ class MainWindow(QMainWindow):
     @Slot(str, str)
     def _append_console(self, text: str, color: str):
         cursor = self.console.textCursor()
+
+        # Sliding window: trim oldest lines when over 70
+        doc = self.console.document()
+        if doc.blockCount() >= 70:
+            trim_cursor = QTextCursor(doc.begin())
+            trim_cursor.select(QTextCursor.BlockUnderCursor)
+            trim_cursor.movePosition(QTextCursor.EndOfBlock, QTextCursor.KeepAnchor)
+            trim_cursor.movePosition(QTextCursor.NextCharacter, QTextCursor.KeepAnchor)
+            trim_cursor.removeSelectedText()
+
         cursor.movePosition(QTextCursor.End)
         fmt = cursor.charFormat()
         fmt.setForeground(QColor(color))

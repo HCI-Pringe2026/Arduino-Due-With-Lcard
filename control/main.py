@@ -19,17 +19,27 @@ import numpy as np
 import serial
 import serial.tools.list_ports
 
-from PySide6.QtCore import (
-    Qt, QTimer, Signal, QObject, QThread, Slot
-)
-from PySide6.QtGui import (
-    QColor, QFont, QPalette, QFontDatabase, QTextCursor
-)
+from PySide6.QtCore import QTimer, Signal, QObject, Slot
+from PySide6.QtGui import QColor, QPalette, QTextCursor
 from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QGridLayout, QLabel, QDoubleSpinBox, QSpinBox, QPushButton,
-    QComboBox, QGroupBox, QStatusBar, QFrame, QSizePolicy,
-    QSplitter, QSlider, QCheckBox, QTextEdit, QLineEdit, QTabWidget
+    QApplication,
+    QMainWindow,
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QGridLayout,
+    QLabel,
+    QDoubleSpinBox,
+    QSpinBox,
+    QPushButton,
+    QComboBox,
+    QGroupBox,
+    QStatusBar,
+    QFrame,
+    QCheckBox,
+    QTextEdit,
+    QLineEdit,
+    QTabWidget,
 )
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -37,21 +47,21 @@ from matplotlib.figure import Figure
 
 # ── Palette ───────────────────────────────────────────────────────────────────
 COLORS = {
-    "bg":        "#0d0f14",
-    "surface":   "#161921",
-    "surface2":  "#1e2330",
-    "border":    "#2a3045",
-    "accent":    "#00e5ff",
-    "accent2":   "#ff6b35",
-    "accent3":   "#7c3aed",
-    "text":      "#e2e8f0",
-    "text_dim":  "#64748b",
-    "green":     "#22c55e",
-    "red":       "#ef4444",
-    "yellow":    "#facc15",
-    "sine1":     "#00e5ff",
-    "sine2":     "#ff6b35",
-    "combined":  "#a78bfa",
+    "bg": "#0d0f14",
+    "surface": "#161921",
+    "surface2": "#1e2330",
+    "border": "#2a3045",
+    "accent": "#00e5ff",
+    "accent2": "#ff6b35",
+    "accent3": "#7c3aed",
+    "text": "#e2e8f0",
+    "text_dim": "#64748b",
+    "green": "#22c55e",
+    "red": "#ef4444",
+    "yellow": "#facc15",
+    "sine1": "#00e5ff",
+    "sine2": "#ff6b35",
+    "combined": "#a78bfa",
 }
 
 STYLE = f"""
@@ -240,11 +250,12 @@ QCheckBox::indicator:checked {{
 }}
 """
 
+
 # ── Serial worker ─────────────────────────────────────────────────────────────
 class SerialWorker(QObject):
-    message_received = Signal(str)   # raw line from board
-    error_occurred   = Signal(str)
-    connected        = Signal(bool)
+    message_received = Signal(str)  # raw line from board
+    error_occurred = Signal(str)
+    connected = Signal(bool)
 
     def __init__(self):
         super().__init__()
@@ -278,7 +289,7 @@ class SerialWorker(QObject):
             if not self._port or not self._port.is_open:
                 return None
             try:
-                self._port.reset_input_buffer()   # flush stale bytes
+                self._port.reset_input_buffer()  # flush stale bytes
                 self._port.write((cmd.strip() + "\n").encode())
                 deadline = time.time() + 0.3
                 while time.time() < deadline:
@@ -338,17 +349,17 @@ class WaveformCanvas(FigureCanvas):
         self.ax.cla()
         self._style_axes()
 
-        f_min    = min(f1, f2) if min(f1, f2) > 0 else max(f1, f2)
+        f_min = min(f1, f2) if min(f1, f2) > 0 else max(f1, f2)
 
         # Adaptive duration: show enough periods to see the full shape.
         # At low frequencies keep ≥3 periods visible; cap total at 50 ms for high freqs.
         if f_min > 0:
             period = 1.0 / f_min
-            if period < 0.005:          # f > 200 Hz  → standard 2-period view, ≤50 ms
+            if period < 0.005:  # f > 200 Hz  → standard 2-period view, ≤50 ms
                 duration = min(2.0 * period, 0.05)
-            elif period < 0.05:         # 20–200 Hz   → show 3 periods
+            elif period < 0.05:  # 20–200 Hz   → show 3 periods
                 duration = 3.0 * period
-            else:                       # < 20 Hz     → show 4 periods, cap at 4 s
+            else:  # < 20 Hz     → show 4 periods, cap at 4 s
                 duration = min(4.0 * period, 4.0)
         else:
             duration = 0.05
@@ -359,37 +370,65 @@ class WaveformCanvas(FigureCanvas):
 
         denom = np.sin(np.pi * (f2 - f1) * t + np.pi / 2)
         with np.errstate(divide="ignore", invalid="ignore"):
-            env = np.where(np.abs(denom) < 1e-9,
-                           gain_max,
-                           np.clip(np.abs(1.0 / denom), 0, gain_max))
+            env = np.where(
+                np.abs(denom) < 1e-9,
+                gain_max,
+                np.clip(np.abs(1.0 / denom), 0, gain_max),
+            )
 
-        sines    = a1 * np.sin(2*np.pi*f1*t + p1) + a2 * np.sin(2*np.pi*f2*t + p2)
+        sines = a1 * np.sin(2 * np.pi * f1 * t + p1) + a2 * np.sin(
+            2 * np.pi * f2 * t + p2
+        )
         combined = np.clip(dc + env * sines, 0, 3.3)
-        t_ms     = t * 1000
+        t_ms = t * 1000
 
-        self.ax.plot(t_ms, dc + a1*np.sin(2*np.pi*f1*t+p1),
-                     color=COLORS["sine1"], lw=0.8, alpha=0.35, label="Sine 1")
-        self.ax.plot(t_ms, dc + a2*np.sin(2*np.pi*f2*t+p2),
-                     color=COLORS["sine2"], lw=0.8, alpha=0.35, label="Sine 2")
+        self.ax.plot(
+            t_ms,
+            dc + a1 * np.sin(2 * np.pi * f1 * t + p1),
+            color=COLORS["sine1"],
+            lw=0.8,
+            alpha=0.35,
+            label="Sine 1",
+        )
+        self.ax.plot(
+            t_ms,
+            dc + a2 * np.sin(2 * np.pi * f2 * t + p2),
+            color=COLORS["sine2"],
+            lw=0.8,
+            alpha=0.35,
+            label="Sine 2",
+        )
 
-        env_top = np.clip(dc + env*(np.abs(a1)+np.abs(a2)), 0, 3.3)
-        env_bot = np.clip(dc - env*(np.abs(a1)+np.abs(a2)), 0, 3.3)
-        self.ax.fill_between(t_ms, env_bot, env_top, color=COLORS["combined"], alpha=0.07)
-        self.ax.plot(t_ms, env_top, color=COLORS["combined"], lw=0.6, alpha=0.4, ls="--")
-        self.ax.plot(t_ms, env_bot, color=COLORS["combined"], lw=0.6, alpha=0.4, ls="--")
+        env_top = np.clip(dc + env * (np.abs(a1) + np.abs(a2)), 0, 3.3)
+        env_bot = np.clip(dc - env * (np.abs(a1) + np.abs(a2)), 0, 3.3)
+        self.ax.fill_between(
+            t_ms, env_bot, env_top, color=COLORS["combined"], alpha=0.07
+        )
+        self.ax.plot(
+            t_ms, env_top, color=COLORS["combined"], lw=0.6, alpha=0.4, ls="--"
+        )
+        self.ax.plot(
+            t_ms, env_bot, color=COLORS["combined"], lw=0.6, alpha=0.4, ls="--"
+        )
         self.ax.plot(t_ms, combined, color=COLORS["combined"], lw=1.6, label="Combined")
 
-        self.ax.axhline(3.3, color=COLORS["red"],    lw=0.5, ls="--", alpha=0.5)
-        self.ax.axhline(0,   color=COLORS["border"], lw=0.5, ls="--")
-        self.ax.legend(loc="upper right", fontsize=7,
-                       facecolor=COLORS["surface"], edgecolor=COLORS["border"],
-                       labelcolor=COLORS["text"])
+        self.ax.axhline(3.3, color=COLORS["red"], lw=0.5, ls="--", alpha=0.5)
+        self.ax.axhline(0, color=COLORS["border"], lw=0.5, ls="--")
+        self.ax.legend(
+            loc="upper right",
+            fontsize=7,
+            facecolor=COLORS["surface"],
+            edgecolor=COLORS["border"],
+            labelcolor=COLORS["text"],
+        )
         self.ax.set_xlabel("time (ms)", fontsize=8)
         self.ax.set_ylabel("Voltage (V)", fontsize=8)
         self.ax.set_title(
             f"peak {float(np.max(combined)):.3f} V  |  "
             f"trough {float(np.min(combined)):.3f} V  |  gain cap ×{gain_max:.1f}",
-            fontsize=8, color=COLORS["text_dim"])
+            fontsize=8,
+            color=COLORS["text_dim"],
+        )
         self.fig.tight_layout(pad=1.2)
         self.draw()
 
@@ -409,24 +448,24 @@ class TelemetryCanvas(FigureCanvas):
     - The background is invalidated and redrawn whenever the widget is resized.
     """
 
-    WINDOW = 70          # visible sliding-window width (samples)
+    WINDOW = 70  # visible sliding-window width (samples)
 
     def __init__(self):
         self.fig = Figure(figsize=(5, 2.2), facecolor=COLORS["bg"])
         super().__init__(self.fig)
-        self.ax_v   = self.fig.add_subplot(211)
+        self.ax_v = self.fig.add_subplot(211)
         self.ax_env = self.fig.add_subplot(212)
 
-        self._v_buf      = deque(maxlen=self.WINDOW)
-        self._env_buf    = deque(maxlen=self.WINDOW)
-        self._peak_buf   = deque(maxlen=self.WINDOW)
+        self._v_buf = deque(maxlen=self.WINDOW)
+        self._env_buf = deque(maxlen=self.WINDOW)
+        self._peak_buf = deque(maxlen=self.WINDOW)
         self._trough_buf = deque(maxlen=self.WINDOW)
 
         # Pending data pushed from the drain thread; consumed by _flush_timer
         self._pending: list[tuple] = []
         self._pending_lock = threading.Lock()
 
-        self._bg_v   = None   # cached background bitmaps
+        self._bg_v = None  # cached background bitmaps
         self._bg_env = None
         self._initialized = False
 
@@ -453,34 +492,60 @@ class TelemetryCanvas(FigureCanvas):
         self.ax_v.axhline(3.3, color=COLORS["red"], lw=0.4, ls=":", alpha=0.5)
 
         self.ax_env.set_ylabel("gain", fontsize=7, color=COLORS["text_dim"])
-        self.ax_env.set_xlabel("samples (last 70)", fontsize=7, color=COLORS["text_dim"])
+        self.ax_env.set_xlabel(
+            "samples (last 70)", fontsize=7, color=COLORS["text_dim"]
+        )
 
         self.fig.tight_layout(pad=0.8, h_pad=0.4)
 
         # Animated lines — created once, data updated in place
-        (self._line_v,)      = self.ax_v.plot([], [], color=COLORS["combined"],
-                                               lw=1.0, label="V_out", animated=True)
-        (self._line_peak,)   = self.ax_v.plot([], [], color=COLORS["red"],
-                                               lw=0.6, ls="--", alpha=0.6,
-                                               label="peak", animated=True)
-        (self._line_trough,) = self.ax_v.plot([], [], color=COLORS["sine1"],
-                                               lw=0.6, ls="--", alpha=0.6,
-                                               label="trough", animated=True)
-        (self._line_env,)    = self.ax_env.plot([], [], color=COLORS["sine2"],
-                                                 lw=1.0, label="envelope", animated=True)
+        (self._line_v,) = self.ax_v.plot(
+            [], [], color=COLORS["combined"], lw=1.0, label="V_out", animated=True
+        )
+        (self._line_peak,) = self.ax_v.plot(
+            [],
+            [],
+            color=COLORS["red"],
+            lw=0.6,
+            ls="--",
+            alpha=0.6,
+            label="peak",
+            animated=True,
+        )
+        (self._line_trough,) = self.ax_v.plot(
+            [],
+            [],
+            color=COLORS["sine1"],
+            lw=0.6,
+            ls="--",
+            alpha=0.6,
+            label="trough",
+            animated=True,
+        )
+        (self._line_env,) = self.ax_env.plot(
+            [], [], color=COLORS["sine2"], lw=1.0, label="envelope", animated=True
+        )
 
         # Static legends (non-animated, drawn as part of background)
-        self.ax_v.legend(loc="upper right", fontsize=6,
-                         facecolor=COLORS["surface"], edgecolor=COLORS["border"],
-                         labelcolor=COLORS["text"])
-        self.ax_env.legend(loc="upper right", fontsize=6,
-                           facecolor=COLORS["surface"], edgecolor=COLORS["border"],
-                           labelcolor=COLORS["text"])
+        self.ax_v.legend(
+            loc="upper right",
+            fontsize=6,
+            facecolor=COLORS["surface"],
+            edgecolor=COLORS["border"],
+            labelcolor=COLORS["text"],
+        )
+        self.ax_env.legend(
+            loc="upper right",
+            fontsize=6,
+            facecolor=COLORS["surface"],
+            edgecolor=COLORS["border"],
+            labelcolor=COLORS["text"],
+        )
 
     def _cache_background(self):
         """Full draw then snapshot the static background for blitting."""
         self.draw()
-        self._bg_v   = self.copy_from_bbox(self.ax_v.bbox)
+        self._bg_v = self.copy_from_bbox(self.ax_v.bbox)
         self._bg_env = self.copy_from_bbox(self.ax_env.bbox)
         self._initialized = True
 
@@ -564,7 +629,7 @@ def make_spinbox(min_val, max_val, decimals, step, value, suffix="") -> QDoubleS
 # ── Main window ───────────────────────────────────────────────────────────────
 class MainWindow(QMainWindow):
     # Signal so serial thread can safely append text to the console
-    _console_append = Signal(str, str)   # (text, css_color)
+    _console_append = Signal(str, str)  # (text, css_color)
 
     def __init__(self):
         super().__init__()
@@ -586,7 +651,7 @@ class MainWindow(QMainWindow):
         # Telemetry drain timer — poll serial for unsolicited debug JSON
         self._drain_timer = QTimer(self)
         self._drain_timer.timeout.connect(self._drain_serial)
-        self._drain_timer.start(50)   # 20 Hz poll
+        self._drain_timer.start(50)  # 20 Hz poll
 
         # Clip counters for stats panel
         self._total_clip_hi = 0
@@ -610,7 +675,9 @@ class MainWindow(QMainWindow):
         left.addWidget(self._build_transport_box())
         left.addStretch()
 
-        left_w = QWidget(); left_w.setLayout(left); left_w.setFixedWidth(360)
+        left_w = QWidget()
+        left_w.setLayout(left)
+        left_w.setFixedWidth(360)
 
         # Right panel: tabbed (Preview / Debug)
         right = QVBoxLayout()
@@ -618,12 +685,13 @@ class MainWindow(QMainWindow):
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_preview_tab(), "PREVIEW")
-        self.tabs.addTab(self._build_debug_tab(),   "DEBUG  CONSOLE")
+        self.tabs.addTab(self._build_debug_tab(), "DEBUG  CONSOLE")
 
         right.addWidget(self.tabs, 1)
         self._build_stats_panel(right)
 
-        right_w = QWidget(); right_w.setLayout(right)
+        right_w = QWidget()
+        right_w.setLayout(right)
 
         root.addWidget(left_w)
         root.addWidget(right_w, 1)
@@ -661,25 +729,30 @@ class MainWindow(QMainWindow):
         stats_frame = QFrame()
         stats_frame.setStyleSheet(
             f"QFrame {{ background:{COLORS['surface']}; border:1px solid {COLORS['border']};"
-            f"border-radius:4px; }}")
+            f"border-radius:4px; }}"
+        )
         sg = QGridLayout(stats_frame)
         sg.setContentsMargins(10, 6, 10, 6)
         sg.setHorizontalSpacing(20)
 
         def dstat(label, attr, col):
             lb = QLabel(label)
-            lb.setStyleSheet(f"color:{COLORS['text_dim']};font-size:10px;letter-spacing:1px;")
+            lb.setStyleSheet(
+                f"color:{COLORS['text_dim']};font-size:10px;letter-spacing:1px;"
+            )
             vl = QLabel("—")
-            vl.setStyleSheet(f"color:{COLORS['text']};font-family:'JetBrains Mono';font-size:11px;")
+            vl.setStyleSheet(
+                f"color:{COLORS['text']};font-family:'JetBrains Mono';font-size:11px;"
+            )
             setattr(self, attr, vl)
             sg.addWidget(lb, 0, col)
             sg.addWidget(vl, 1, col)
 
-        dstat("ISR µs",   "dstat_isr",     0)
-        dstat("CLIP ↑",   "dstat_cliphi",  1)
-        dstat("CLIP ↓",   "dstat_cliplo",  2)
-        dstat("SAMPLES",  "dstat_samps",   3)
-        dstat("ENV GAIN", "dstat_env",     4)
+        dstat("ISR µs", "dstat_isr", 0)
+        dstat("CLIP ↑", "dstat_cliphi", 1)
+        dstat("CLIP ↓", "dstat_cliplo", 2)
+        dstat("SAMPLES", "dstat_samps", 3)
+        dstat("ENV GAIN", "dstat_env", 4)
         v.addWidget(stats_frame)
 
         # ── Raw serial log ────────────────────────────────────────────────────
@@ -753,28 +826,30 @@ class MainWindow(QMainWindow):
         def row(label, widget):
             r = grid.rowCount()
             lbl = QLabel(label)
-            lbl.setStyleSheet(f"color:{COLORS['text_dim']};font-size:14px;background-color:transparent;")
+            lbl.setStyleSheet(
+                f"color:{COLORS['text_dim']};font-size:14px;background-color:transparent;"
+            )
             grid.addWidget(lbl, r, 0)
             grid.addWidget(widget, r, 1)
 
         if idx == "1":
-            self.amp1   = make_spinbox(0, 1.65,  3, 0.05,  0.5,   "V")
-            self.freq1  = make_spinbox(0, 5000,  2, 10.0,  100.0, "Hz")
-            self.phase1 = make_spinbox(-360, 360, 1, 5.0,  0.0,   "°")
+            self.amp1 = make_spinbox(0, 1.65, 3, 0.05, 0.5, "V")
+            self.freq1 = make_spinbox(0, 5000, 2, 10.0, 100.0, "Hz")
+            self.phase1 = make_spinbox(-360, 360, 1, 5.0, 0.0, "°")
             for c in (self.amp1, self.freq1, self.phase1):
                 c.valueChanged.connect(self._param_changed)
             row("Amplitude", self.amp1)
             row("Frequency", self.freq1)
-            row("Phase",     self.phase1)
+            row("Phase", self.phase1)
         else:
-            self.amp2   = make_spinbox(0, 1.65,  3, 0.05,  0.5,   "V")
-            self.freq2  = make_spinbox(0, 5000,  2, 10.0,  200.0, "Hz")
-            self.phase2 = make_spinbox(-360, 360, 1, 5.0,  0.0,   "°")
+            self.amp2 = make_spinbox(0, 1.65, 3, 0.05, 0.5, "V")
+            self.freq2 = make_spinbox(0, 5000, 2, 10.0, 200.0, "Hz")
+            self.phase2 = make_spinbox(-360, 360, 1, 5.0, 0.0, "°")
             for c in (self.amp2, self.freq2, self.phase2):
                 c.valueChanged.connect(self._param_changed)
             row("Amplitude", self.amp2)
             row("Frequency", self.freq2)
-            row("Phase",     self.phase2)
+            row("Phase", self.phase2)
         return box
 
     def _build_global_box(self) -> QGroupBox:
@@ -786,27 +861,31 @@ class MainWindow(QMainWindow):
         def row(label, widget):
             r = grid.rowCount()
             lbl = QLabel(label)
-            lbl.setStyleSheet(f"color:{COLORS['text_dim']};font-size:14px;background-color:transparent;")
+            lbl.setStyleSheet(
+                f"color:{COLORS['text_dim']};font-size:14px;background-color:transparent;"
+            )
             grid.addWidget(lbl, r, 0)
             grid.addWidget(widget, r, 1)
 
-        self.dc_offset   = make_spinbox(0, 3.3,   3, 0.05, 1.65,  "V")
+        self.dc_offset = make_spinbox(0, 3.3, 3, 0.05, 1.65, "V")
         self.sample_rate = QSpinBox()
         self.sample_rate.setRange(100, 100000)
         self.sample_rate.setValue(10000)
         self.sample_rate.setSuffix("  Hz")
         self.sample_rate.setSingleStep(1000)
-        self.gain_max    = make_spinbox(1.0, 20.0, 1, 0.5,  4.0,  "×")
+        self.gain_max = make_spinbox(1.0, 20.0, 1, 0.5, 4.0, "×")
 
         for c in (self.dc_offset, self.sample_rate, self.gain_max):
             c.valueChanged.connect(self._param_changed)
 
-        row("DC Offset",   self.dc_offset)
+        row("DC Offset", self.dc_offset)
         row("Sample Rate", self.sample_rate)
         row("Max Env Gain", self.gain_max)
 
         self.clip_label = QLabel("")
-        self.clip_label.setStyleSheet(f"color:{COLORS['red']};font-size:10px;background-color:transparent;")
+        self.clip_label.setStyleSheet(
+            f"color:{COLORS['red']};font-size:10px;background-color:transparent;"
+        )
         grid.addWidget(self.clip_label, grid.rowCount(), 0, 1, 3)
         return box
 
@@ -838,23 +917,28 @@ class MainWindow(QMainWindow):
         frame = QFrame()
         frame.setStyleSheet(
             f"QFrame {{ background:{COLORS['surface']}; border:1px solid {COLORS['border']};"
-            f"border-radius:6px; }}")
+            f"border-radius:6px; }}"
+        )
         grid = QGridLayout(frame)
         grid.setContentsMargins(12, 8, 12, 8)
         grid.setHorizontalSpacing(24)
 
         def stat(label, attr, col):
             lb = QLabel(label)
-            lb.setStyleSheet(f"color:{COLORS['text_dim']};font-size:10px;letter-spacing:1px;")
+            lb.setStyleSheet(
+                f"color:{COLORS['text_dim']};font-size:10px;letter-spacing:1px;"
+            )
             vl = QLabel("—")
-            vl.setStyleSheet(f"color:{COLORS['text']};font-family:'JetBrains Mono';font-size:12px;")
+            vl.setStyleSheet(
+                f"color:{COLORS['text']};font-family:'JetBrains Mono';font-size:12px;"
+            )
             setattr(self, attr, vl)
             grid.addWidget(lb, 0, col)
             grid.addWidget(vl, 1, col)
 
-        stat("PEAK",    "stat_peak",    0)
-        stat("TROUGH",  "stat_trough",  1)
-        stat("VRANGE",  "stat_range",   2)
+        stat("PEAK", "stat_peak", 0)
+        stat("TROUGH", "stat_trough", 1)
+        stat("VRANGE", "stat_range", 2)
         stat("NYQUIST", "stat_nyquist", 3)
         layout.addWidget(frame)
 
@@ -869,9 +953,12 @@ class MainWindow(QMainWindow):
 
     def _get_params(self) -> dict:
         return {
-            "a1": self.amp1.value(),   "f1": self.freq1.value(),
-            "p1": self.phase1.value(), "a2": self.amp2.value(),
-            "f2": self.freq2.value(),  "p2": self.phase2.value(),
+            "a1": self.amp1.value(),
+            "f1": self.freq1.value(),
+            "p1": self.phase1.value(),
+            "a2": self.amp2.value(),
+            "f2": self.freq2.value(),
+            "p2": self.phase2.value(),
             "dc": self.dc_offset.value(),
             "sr": self.sample_rate.value(),
             "gain_max": self.gain_max.value(),
@@ -882,8 +969,10 @@ class MainWindow(QMainWindow):
         hi = p["dc"] + g * (p["a1"] + p["a2"])
         lo = p["dc"] - g * (p["a1"] + p["a2"])
         w = []
-        if hi > 3.3: w.append(f"⚠ peak up to +{hi:.3f} V (clamped)")
-        if lo < 0.0: w.append(f"⚠ trough down to {lo:.3f} V (clamped)")
+        if hi > 3.3:
+            w.append(f"⚠ peak up to +{hi:.3f} V (clamped)")
+        if lo < 0.0:
+            w.append(f"⚠ trough down to {lo:.3f} V (clamped)")
         return "  ".join(w)
 
     # ── Preview refresh ───────────────────────────────────────────────────────
@@ -891,18 +980,35 @@ class MainWindow(QMainWindow):
         p = self._get_params()
         self.clip_label.setText(self._check_clipping(p))
         self.canvas.update_plot(
-            a1=p["a1"], f1=p["f1"], p1_deg=p["p1"],
-            a2=p["a2"], f2=p["f2"], p2_deg=p["p2"],
-            dc=p["dc"], sr=p["sr"], gain_max=p["gain_max"])
+            a1=p["a1"],
+            f1=p["f1"],
+            p1_deg=p["p1"],
+            a2=p["a2"],
+            f2=p["f2"],
+            p2_deg=p["p2"],
+            dc=p["dc"],
+            sr=p["sr"],
+            gain_max=p["gain_max"],
+        )
 
         t = np.linspace(0, 0.1, 50000)
         denom = np.sin(np.pi * (p["f2"] - p["f1"]) * t + np.pi / 2)
         with np.errstate(divide="ignore", invalid="ignore"):
-            env = np.where(np.abs(denom) < 1e-9, p["gain_max"],
-                           np.clip(np.abs(1.0 / denom), 0, p["gain_max"]))
-        s = np.clip(p["dc"] + env * (
-            p["a1"] * np.sin(2*np.pi*p["f1"]*t + np.radians(p["p1"])) +
-            p["a2"] * np.sin(2*np.pi*p["f2"]*t + np.radians(p["p2"]))), 0, 3.3)
+            env = np.where(
+                np.abs(denom) < 1e-9,
+                p["gain_max"],
+                np.clip(np.abs(1.0 / denom), 0, p["gain_max"]),
+            )
+        s = np.clip(
+            p["dc"]
+            + env
+            * (
+                p["a1"] * np.sin(2 * np.pi * p["f1"] * t + np.radians(p["p1"]))
+                + p["a2"] * np.sin(2 * np.pi * p["f2"] * t + np.radians(p["p2"]))
+            ),
+            0,
+            3.3,
+        )
 
         self.stat_peak.setText(f"{np.max(s):.3f} V")
         self.stat_trough.setText(f"{np.min(s):.3f} V")
@@ -925,10 +1031,10 @@ class MainWindow(QMainWindow):
         if d.get("dbg"):
             # Update live telemetry chart
             self.telem_canvas.push(
-                v      = float(d.get("v",      0)),
-                env    = float(d.get("env",    0)),
-                peak   = float(d.get("peak",   0)),
-                trough = float(d.get("trough", 0)),
+                v=float(d.get("v", 0)),
+                env=float(d.get("env", 0)),
+                peak=float(d.get("peak", 0)),
+                trough=float(d.get("trough", 0)),
             )
             # Update debug stat labels
             self._total_clip_hi += int(d.get("clipHi", 0))
@@ -940,10 +1046,15 @@ class MainWindow(QMainWindow):
             self.dstat_env.setText(f"{float(d.get('env', 0)):.3f}")
 
             # Highlight clips in red if nonzero this window
-            clip_color = COLORS["red"] if (d.get("clipHi", 0) or d.get("clipLo", 0)) \
-                         else COLORS["text_dim"]
+            clip_color = (
+                COLORS["red"]
+                if (d.get("clipHi", 0) or d.get("clipLo", 0))
+                else COLORS["text_dim"]
+            )
             for lbl in (self.dstat_cliphi, self.dstat_cliplo):
-                lbl.setStyleSheet(f"color:{clip_color};font-family:'JetBrains Mono';font-size:11px;")
+                lbl.setStyleSheet(
+                    f"color:{clip_color};font-family:'JetBrains Mono';font-size:11px;"
+                )
 
             # Log to console with compact format
             self._log(
@@ -951,7 +1062,8 @@ class MainWindow(QMainWindow):
                 f"peak={d['peak']:.3f}  trough={d['trough']:.3f}  "
                 f"clip↑={d['clipHi']}  clip↓={d['clipLo']}  "
                 f"ISR={d['isrUs']}µs  n={d['samps']}",
-                COLORS["text_dim"])
+                COLORS["text_dim"],
+            )
 
         elif d.get("status"):
             self._log(f"[STATUS] {json.dumps(d)}", COLORS["accent"])
@@ -994,8 +1106,13 @@ class MainWindow(QMainWindow):
         self.telem_canvas.clear()
         self._total_clip_hi = 0
         self._total_clip_lo = 0
-        for attr in ("dstat_isr", "dstat_cliphi", "dstat_cliplo",
-                     "dstat_samps", "dstat_env"):
+        for attr in (
+            "dstat_isr",
+            "dstat_cliphi",
+            "dstat_cliplo",
+            "dstat_samps",
+            "dstat_env",
+        ):
             getattr(self, attr).setText("—")
 
     def _send_manual_cmd(self):
@@ -1033,7 +1150,7 @@ class MainWindow(QMainWindow):
                     self._log(f"Connected to {port}.", COLORS["green"])
 
     def _param_changed(self):
-        pass   # preview updates via timer; board updated only on APPLY
+        pass  # preview updates via timer; board updated only on APPLY
 
     def _send(self, cmd: str) -> str | None:
         resp = self.serial.send(cmd)
@@ -1046,10 +1163,14 @@ class MainWindow(QMainWindow):
             return
         p = self._get_params()
         cmds = [
-            f"SET A1 {p['a1']:.4f}", f"SET F1 {p['f1']:.4f}",
-            f"SET P1 {p['p1']:.2f}", f"SET A2 {p['a2']:.4f}",
-            f"SET F2 {p['f2']:.4f}", f"SET P2 {p['p2']:.2f}",
-            f"SET DC {p['dc']:.4f}", f"SET GM {p['gain_max']:.2f}",
+            f"SET A1 {p['a1']:.4f}",
+            f"SET F1 {p['f1']:.4f}",
+            f"SET P1 {p['p1']:.2f}",
+            f"SET A2 {p['a2']:.4f}",
+            f"SET F2 {p['f2']:.4f}",
+            f"SET P2 {p['p2']:.2f}",
+            f"SET DC {p['dc']:.4f}",
+            f"SET GM {p['gain_max']:.2f}",
             f"SET SR {int(p['sr'])}",
         ]
         self._log("Applying parameters…", COLORS["accent"])
@@ -1061,7 +1182,7 @@ class MainWindow(QMainWindow):
 
     def _start(self):
         self._apply_all()
-        time.sleep(0.05)   # let Due finish ACKing all SET commands
+        time.sleep(0.05)  # let Due finish ACKing all SET commands
         self._log("→ START", COLORS["green"])
         resp = self._send("START")
         if resp and "OK" in resp:
@@ -1076,7 +1197,6 @@ class MainWindow(QMainWindow):
 
     def _stop(self):
         self._log("→ STOP", COLORS["red"])
-        resp = self._send("STOP")
         self._running = False
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
@@ -1119,14 +1239,14 @@ def main():
     app.setStyle("Fusion")
 
     palette = QPalette()
-    palette.setColor(QPalette.Window,          QColor(COLORS["bg"]))
-    palette.setColor(QPalette.WindowText,      QColor(COLORS["text"]))
-    palette.setColor(QPalette.Base,            QColor(COLORS["surface"]))
-    palette.setColor(QPalette.AlternateBase,   QColor(COLORS["surface2"]))
-    palette.setColor(QPalette.Text,            QColor(COLORS["text"]))
-    palette.setColor(QPalette.Button,          QColor(COLORS["surface2"]))
-    palette.setColor(QPalette.ButtonText,      QColor(COLORS["text"]))
-    palette.setColor(QPalette.Highlight,       QColor(COLORS["accent"]))
+    palette.setColor(QPalette.Window, QColor(COLORS["bg"]))
+    palette.setColor(QPalette.WindowText, QColor(COLORS["text"]))
+    palette.setColor(QPalette.Base, QColor(COLORS["surface"]))
+    palette.setColor(QPalette.AlternateBase, QColor(COLORS["surface2"]))
+    palette.setColor(QPalette.Text, QColor(COLORS["text"]))
+    palette.setColor(QPalette.Button, QColor(COLORS["surface2"]))
+    palette.setColor(QPalette.ButtonText, QColor(COLORS["text"]))
+    palette.setColor(QPalette.Highlight, QColor(COLORS["accent"]))
     palette.setColor(QPalette.HighlightedText, QColor(COLORS["bg"]))
     app.setPalette(palette)
     app.setStyleSheet(STYLE)

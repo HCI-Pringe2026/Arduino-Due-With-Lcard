@@ -121,7 +121,6 @@ QPushButton:disabled {{
     background-color: {COLORS['surface']};
     border-color: {COLORS['border']};
     color: {COLORS['text_dim']};
-    opacity: 0.4;
 }}
 QPushButton#start_btn {{
     background-color: #163a20;
@@ -382,73 +381,157 @@ class WaveformCanvas(FigureCanvas):
 
 # ── Debug telemetry canvas (scrolling voltage + envelope) ────────────────────
 class TelemetryCanvas(FigureCanvas):
-    WINDOW = 200   # samples kept in rolling buffer
+    """
+    Sliding-window telemetry chart using matplotlib blitting for low-overhead updates.
+
+    Strategy:
+    - Axes chrome (spines, ticks, labels, legends, static hlines) is drawn ONCE
+      and cached as a background bitmap via copy_from_bbox().
+    - On each new sample only the animated line artists are redrawn via blit(),
+      which avoids re-layouting the figure entirely.
+    - A pending-data queue fed from the serial thread is drained by a QTimer on
+      the GUI thread (no cross-thread canvas calls).
+    - The background is invalidated and redrawn whenever the widget is resized.
+    """
+
+    WINDOW = 70          # visible sliding-window width (samples)
 
     def __init__(self):
         self.fig = Figure(figsize=(5, 2.2), facecolor=COLORS["bg"])
         super().__init__(self.fig)
         self.ax_v   = self.fig.add_subplot(211)
         self.ax_env = self.fig.add_subplot(212)
-        self._style()
-        self.setMinimumHeight(160)
 
-        self._v_buf   = deque(maxlen=self.WINDOW)
-        self._env_buf = deque(maxlen=self.WINDOW)
+        self._v_buf      = deque(maxlen=self.WINDOW)
+        self._env_buf    = deque(maxlen=self.WINDOW)
         self._peak_buf   = deque(maxlen=self.WINDOW)
         self._trough_buf = deque(maxlen=self.WINDOW)
 
-    def _style(self):
+        # Pending data pushed from the drain thread; consumed by _flush_timer
+        self._pending: list[tuple] = []
+        self._pending_lock = threading.Lock()
+
+        self._bg_v   = None   # cached background bitmaps
+        self._bg_env = None
+        self._initialized = False
+
+        self.setMinimumHeight(160)
+        self._build_static_elements()
+
+        # Flush pending data at ~20 Hz on the GUI thread
+        self._flush_timer = QTimer()
+        self._flush_timer.timeout.connect(self._flush_pending)
+        self._flush_timer.start(50)
+
+    # ── Static chrome (drawn once) ────────────────────────────────────────────
+    def _build_static_elements(self):
+        """Draw all non-animated chrome and create the animated line objects."""
         for ax in (self.ax_v, self.ax_env):
             ax.set_facecolor(COLORS["surface"])
             for sp in ax.spines.values():
                 sp.set_color(COLORS["border"])
             ax.tick_params(colors=COLORS["text_dim"], labelsize=7)
+            ax.set_xlim(0, self.WINDOW - 1)
+
+        self.ax_v.set_ylim(-0.05, 3.45)
+        self.ax_v.set_ylabel("V", fontsize=7, color=COLORS["text_dim"])
+        self.ax_v.axhline(3.3, color=COLORS["red"], lw=0.4, ls=":", alpha=0.5)
+
+        self.ax_env.set_ylabel("gain", fontsize=7, color=COLORS["text_dim"])
+        self.ax_env.set_xlabel("samples (last 70)", fontsize=7, color=COLORS["text_dim"])
+
         self.fig.tight_layout(pad=0.8, h_pad=0.4)
 
-    def push(self, v, env, peak, trough):
-        self._v_buf.append(v)
-        self._env_buf.append(env)
-        self._peak_buf.append(peak)
-        self._trough_buf.append(trough)
-        self._redraw()
+        # Animated lines — created once, data updated in place
+        (self._line_v,)      = self.ax_v.plot([], [], color=COLORS["combined"],
+                                               lw=1.0, label="V_out", animated=True)
+        (self._line_peak,)   = self.ax_v.plot([], [], color=COLORS["red"],
+                                               lw=0.6, ls="--", alpha=0.6,
+                                               label="peak", animated=True)
+        (self._line_trough,) = self.ax_v.plot([], [], color=COLORS["sine1"],
+                                               lw=0.6, ls="--", alpha=0.6,
+                                               label="trough", animated=True)
+        (self._line_env,)    = self.ax_env.plot([], [], color=COLORS["sine2"],
+                                                 lw=1.0, label="envelope", animated=True)
 
-    def _redraw(self):
-        self.ax_v.cla()
-        self.ax_env.cla()
-        self._style()
-
-        x = range(len(self._v_buf))
-
-        self.ax_v.plot(x, list(self._v_buf),
-                       color=COLORS["combined"], lw=1.0, label="V_out")
-        self.ax_v.plot(x, list(self._peak_buf),
-                       color=COLORS["red"], lw=0.6, ls="--", alpha=0.6, label="peak")
-        self.ax_v.plot(x, list(self._trough_buf),
-                       color=COLORS["sine1"], lw=0.6, ls="--", alpha=0.6, label="trough")
-        self.ax_v.set_ylim(-0.05, 3.45)
-        self.ax_v.axhline(3.3, color=COLORS["red"], lw=0.4, ls=":", alpha=0.5)
-        self.ax_v.set_ylabel("V", fontsize=7, color=COLORS["text_dim"])
+        # Static legends (non-animated, drawn as part of background)
         self.ax_v.legend(loc="upper right", fontsize=6,
                          facecolor=COLORS["surface"], edgecolor=COLORS["border"],
                          labelcolor=COLORS["text"])
-
-        self.ax_env.plot(x, list(self._env_buf),
-                         color=COLORS["sine2"], lw=1.0, label="envelope")
-        self.ax_env.set_ylabel("gain", fontsize=7, color=COLORS["text_dim"])
-        self.ax_env.set_xlabel("telemetry ticks", fontsize=7, color=COLORS["text_dim"])
         self.ax_env.legend(loc="upper right", fontsize=6,
                            facecolor=COLORS["surface"], edgecolor=COLORS["border"],
                            labelcolor=COLORS["text"])
 
-        self.fig.tight_layout(pad=0.8, h_pad=0.4)
+    def _cache_background(self):
+        """Full draw then snapshot the static background for blitting."""
         self.draw()
+        self._bg_v   = self.copy_from_bbox(self.ax_v.bbox)
+        self._bg_env = self.copy_from_bbox(self.ax_env.bbox)
+        self._initialized = True
 
+    def resizeEvent(self, event):  # noqa: N802
+        super().resizeEvent(event)
+        # Invalidate cache so it gets rebuilt on next blit cycle
+        self._initialized = False
+
+    # ── Data ingestion (called from any thread) ───────────────────────────────
+    def push(self, v, env, peak, trough):
+        with self._pending_lock:
+            self._pending.append((v, env, peak, trough))
+
+    # ── GUI-thread flush ──────────────────────────────────────────────────────
+    def _flush_pending(self):
+        with self._pending_lock:
+            if not self._pending:
+                return
+            batch = self._pending
+            self._pending = []
+
+        for v, env, peak, trough in batch:
+            self._v_buf.append(v)
+            self._env_buf.append(env)
+            self._peak_buf.append(peak)
+            self._trough_buf.append(trough)
+
+        self._blit_update()
+
+    def _blit_update(self):
+        if not self._initialized:
+            self._cache_background()
+
+        x = list(range(len(self._v_buf)))
+
+        self._line_v.set_data(x, list(self._v_buf))
+        self._line_peak.set_data(x, list(self._peak_buf))
+        self._line_trough.set_data(x, list(self._trough_buf))
+        self._line_env.set_data(x, list(self._env_buf))
+
+        # Auto-scale env y-axis without full redraw
+        if self._env_buf:
+            env_max = max(self._env_buf)
+            self.ax_env.set_ylim(0, max(env_max * 1.15, 0.1))
+
+        # Restore static background, draw only the animated lines, blit
+        self.restore_region(self._bg_v)
+        self.ax_v.draw_artist(self._line_v)
+        self.ax_v.draw_artist(self._line_peak)
+        self.ax_v.draw_artist(self._line_trough)
+        self.blit(self.ax_v.bbox)
+
+        self.restore_region(self._bg_env)
+        self.ax_env.draw_artist(self._line_env)
+        self.blit(self.ax_env.bbox)
+
+    # ── Clear ─────────────────────────────────────────────────────────────────
     def clear(self):
+        with self._pending_lock:
+            self._pending = []
         self._v_buf.clear()
         self._env_buf.clear()
         self._peak_buf.clear()
         self._trough_buf.clear()
-        self._redraw()
+        self._initialized = False
+        self._cache_background()
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

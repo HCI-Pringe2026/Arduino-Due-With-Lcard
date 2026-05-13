@@ -2475,6 +2475,29 @@ class MainWindow(QMainWindow):
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
+def _show_main_window(win: MainWindow, app: QApplication):
+    if not sys.platform.startswith("linux"):
+        win.showMaximized()
+        return
+
+    def apply_linux_maximized():
+        screen = win.screen() or app.primaryScreen()
+        if screen is not None:
+            win.setGeometry(screen.availableGeometry())
+        win.setWindowState(win.windowState() | Qt.WindowState.WindowMaximized)
+        win.showMaximized()
+
+    screen = app.primaryScreen()
+    if screen is not None:
+        win.setGeometry(screen.availableGeometry())
+
+    win.show()
+    apply_linux_maximized()
+    QTimer.singleShot(0, apply_linux_maximized)
+    QTimer.singleShot(150, apply_linux_maximized)
+    QTimer.singleShot(500, apply_linux_maximized)
+
+
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
@@ -2493,7 +2516,7 @@ def main():
     app.setStyleSheet(STYLE)
 
     win = MainWindow()
-    win.showMaximized()
+    _show_main_window(win, app)
     sys.exit(app.exec())
 
 

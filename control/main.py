@@ -3,7 +3,7 @@ dual_sine_controller.py
 PySide6 desktop app for controlling the Arduino Due dual-sine DAC firmware.
 
 Requirements:
-    pip install PySide6 pyserial numpy matplotlib pylsl pandas scipy
+    pip install PySide6 pyserial numpy pylsl pandas scipy
 
 Usage:
     python dual_sine_controller.py
@@ -578,17 +578,45 @@ class MainWindow(QMainWindow):
         w = QWidget()
         v = QVBoxLayout(w)
         v.setContentsMargins(4, 4, 4, 4)
-        lbl = QLabel("ПРЕДПРОСМОТР  СИГНАЛА")
+        v.setSpacing(10)
+
+        lbl = QLabel("ТАБЛИЦА  ЭТАПОВ")
         lbl.setObjectName("section_label")
         v.addWidget(lbl)
-        self.canvas = WaveformCanvas()
-        v.addWidget(self.canvas, 1)
 
-        seq_lbl = QLabel("ВИЗУАЛИЗАЦИЯ  ФАЙЛА  ЧАСТОТ")
-        seq_lbl.setObjectName("section_label")
-        v.addWidget(seq_lbl)
-        self.sequence_canvas = SequenceCanvas()
-        v.addWidget(self.sequence_canvas, 1)
+        self.sequence_table = QTableWidget(0, 4)
+        self.sequence_table.setHorizontalHeaderLabels(
+            ["№ этапа", "Частота 1", "Частота 2", "Оставшееся время"]
+        )
+        self.sequence_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.sequence_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.sequence_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.sequence_table.verticalHeader().setVisible(False)
+        self.sequence_table.setAlternatingRowColors(False)
+        header = self.sequence_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        v.addWidget(self.sequence_table, 1)
+
+        self.stage_time_label = QLabel("ТЕКУЩИЙ  ЭТАП")
+        self.stage_time_label.setObjectName("section_label")
+        v.addWidget(self.stage_time_label)
+        self.stage_time_bar = QProgressBar()
+        self.stage_time_bar.setRange(0, 1000)
+        self.stage_time_bar.setValue(0)
+        self.stage_time_bar.setTextVisible(True)
+        self.stage_time_bar.setFormat("Этап: ожидание")
+        v.addWidget(self.stage_time_bar)
+
+        self.total_time_label = QLabel("ВЕСЬ  ЭКСПЕРИМЕНТ")
+        self.total_time_label.setObjectName("section_label")
+        v.addWidget(self.total_time_label)
+        self.total_time_bar = QProgressBar()
+        self.total_time_bar.setRange(0, 1000)
+        self.total_time_bar.setValue(0)
+        self.total_time_bar.setTextVisible(True)
+        self.total_time_bar.setFormat("Эксперимент: ожидание")
+        v.addWidget(self.total_time_bar)
         return w
 
     def _build_debug_tab(self) -> QWidget:
@@ -597,13 +625,9 @@ class MainWindow(QMainWindow):
         v.setContentsMargins(4, 4, 4, 4)
         v.setSpacing(6)
 
-        # ── Telemetry chart ───────────────────────────────────────────────────
-        telem_label = QLabel("ТЕЛЕМЕТРИЯ  С  ПЛАТЫ  (~10 Гц)")
+        telem_label = QLabel("ПОКАЗАТЕЛИ  С  ПЛАТЫ  (~10 Гц)")
         telem_label.setObjectName("section_label")
         v.addWidget(telem_label)
-
-        self.telem_canvas = TelemetryCanvas()
-        v.addWidget(self.telem_canvas)
 
         # ── Debug stats bar ───────────────────────────────────────────────────
         stats_frame = QFrame()
@@ -838,45 +862,21 @@ class MainWindow(QMainWindow):
         self.sequence_path_edit.setPlaceholderText("Файл последовательности не загружен")
         grid.addWidget(self.sequence_path_edit, 0, 0, 1, 2)
 
-        self.sequence_status = QLabel("Формат: F1  F2  секунды")
+        self.sequence_status = QLabel("Формат: F1 секунды или F1 F2 секунды")
         self.sequence_status.setStyleSheet(
             f"color:{COLORS['text_dim']};font-size:10px;background-color:transparent;"
         )
         grid.addWidget(self.sequence_status, 1, 0, 1, 2)
 
-        self.stage_time_label = QLabel("Этап: ожидание")
-        self.stage_time_label.setStyleSheet(
-            f"color:{COLORS['text_dim']};font-size:10px;background-color:transparent;"
-        )
-        grid.addWidget(self.stage_time_label, 2, 0, 1, 2)
-
-        self.stage_time_bar = QProgressBar()
-        self.stage_time_bar.setRange(0, 1000)
-        self.stage_time_bar.setValue(0)
-        self.stage_time_bar.setTextVisible(False)
-        grid.addWidget(self.stage_time_bar, 3, 0, 1, 2)
-
-        self.total_time_label = QLabel("Эксперимент: ожидание")
-        self.total_time_label.setStyleSheet(
-            f"color:{COLORS['text_dim']};font-size:10px;background-color:transparent;"
-        )
-        grid.addWidget(self.total_time_label, 4, 0, 1, 2)
-
-        self.total_time_bar = QProgressBar()
-        self.total_time_bar.setRange(0, 1000)
-        self.total_time_bar.setValue(0)
-        self.total_time_bar.setTextVisible(False)
-        grid.addWidget(self.total_time_bar, 5, 0, 1, 2)
-
         self.sequence_load_btn = QPushButton("ЗАГРУЗИТЬ")
         self.sequence_load_btn.clicked.connect(self._load_sequence_file)
-        grid.addWidget(self.sequence_load_btn, 6, 0)
+        grid.addWidget(self.sequence_load_btn, 2, 0)
 
         self.sequence_clear_btn = QPushButton("СБРОС")
         self.sequence_clear_btn.setObjectName("clear_btn")
         self.sequence_clear_btn.clicked.connect(self._clear_sequence_file)
         self.sequence_clear_btn.setEnabled(False)
-        grid.addWidget(self.sequence_clear_btn, 6, 1)
+        grid.addWidget(self.sequence_clear_btn, 2, 1)
         return box
 
     def _build_global_box(self) -> QGroupBox:
@@ -1216,15 +1216,15 @@ class MainWindow(QMainWindow):
         self.sequence_steps = steps
         self.sequence_file_path = path
         self._sequence_index = 0
-        total_seconds = sum(step[2] for step in steps)
+        total_seconds = self._sequence_total_seconds()
         self.sequence_path_edit.setText(Path(path).name)
         self.sequence_path_edit.setToolTip(path)
         self.sequence_status.setText(
-            f"Шагов: {len(steps)} | всего: {total_seconds:.3f} с | F1/F2 из UI игнорируются"
+            f"Шагов: {len(steps)} | всего: {total_seconds:.3f} с | частоты UI игнорируются"
         )
         self.sequence_clear_btn.setEnabled(True)
         self._set_frequency_controls_enabled(False)
-        self.sequence_canvas.update_sequence(steps)
+        self._populate_sequence_table()
         self._reset_sequence_progress(total_seconds)
         self.tabs.setCurrentIndex(0)
         self._log(
@@ -1241,14 +1241,14 @@ class MainWindow(QMainWindow):
         self._sequence_index = 0
         self.sequence_path_edit.clear()
         self.sequence_path_edit.setToolTip("")
-        self.sequence_status.setText("Формат: F1  F2  секунды")
+        self.sequence_status.setText("Формат: F1 секунды или F1 F2 секунды")
         self.sequence_clear_btn.setEnabled(False)
         self._set_frequency_controls_enabled(True)
-        self.sequence_canvas.update_sequence([])
+        self._populate_sequence_table()
         self._reset_sequence_progress()
         self._log("Файл частот сброшен. Поля F1/F2 снова активны.", COLORS["text_dim"])
 
-    def _parse_sequence_file(self, path: str) -> list[tuple[float, float, float]]:
+    def _parse_sequence_file(self, path: str) -> list[SequenceStep]:
         steps = []
         errors = []
         with open(path, "r", encoding="utf-8-sig") as f:
@@ -1261,25 +1261,31 @@ class MainWindow(QMainWindow):
                     continue
 
                 parts = [p for p in re.split(r"[\s,;]+", line) if p]
-                if len(parts) != 3:
+                if len(parts) not in (2, 3):
                     errors.append(
-                        f"строка {line_no}: ожидалось 3 значения (F1 F2 секунды), получено {len(parts)}"
+                        f"строка {line_no}: ожидалось 2 или 3 значения (F1 секунды или F1 F2 секунды), получено {len(parts)}"
                     )
                     continue
 
                 try:
-                    f1, f2, seconds = (float(p) for p in parts)
+                    values = [float(p) for p in parts]
                 except ValueError:
                     errors.append(f"строка {line_no}: значения должны быть числами")
                     continue
 
-                if not (0 <= f1 <= 5000 and 0 <= f2 <= 5000):
+                if len(values) == 2:
+                    f1, seconds = values
+                    f2 = None
+                else:
+                    f1, f2, seconds = values
+
+                if not (0 <= f1 <= 5000) or (f2 is not None and not (0 <= f2 <= 5000)):
                     errors.append(f"строка {line_no}: частоты должны быть в диапазоне 0..5000 Гц")
                     continue
                 if seconds <= 0:
                     errors.append(f"строка {line_no}: длительность должна быть больше 0")
                     continue
-                steps.append((f1, f2, seconds))
+                steps.append(SequenceStep(f1=f1, f2=f2, seconds=seconds))
 
         if errors:
             preview = "; ".join(errors[:5])
@@ -1294,6 +1300,9 @@ class MainWindow(QMainWindow):
         for widget in (self.freq1, self.freq2):
             widget.setEnabled(enabled)
 
+    def _sequence_total_seconds(self) -> float:
+        return sum(step.seconds for step in self.sequence_steps)
+
     def _format_seconds(self, seconds: float) -> str:
         seconds = max(0.0, float(seconds))
         total = int(round(seconds))
@@ -1303,6 +1312,67 @@ class MainWindow(QMainWindow):
             return f"{hours:d}:{minutes:02d}:{secs:02d}"
         return f"{minutes:02d}:{secs:02d}"
 
+    def _format_step_frequency(self, value: float | None) -> str:
+        if value is None:
+            return "выкл."
+        return f"{value:.4f} Гц"
+
+    def _make_sequence_table_item(self, text: str) -> QTableWidgetItem:
+        item = QTableWidgetItem(text)
+        item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+        return item
+
+    def _populate_sequence_table(self):
+        self.sequence_table.setRowCount(len(self.sequence_steps))
+        for row, step in enumerate(self.sequence_steps):
+            values = [
+                str(row + 1),
+                self._format_step_frequency(step.f1),
+                self._format_step_frequency(step.f2),
+                self._format_seconds(step.seconds),
+            ]
+            for col, value in enumerate(values):
+                self.sequence_table.setItem(row, col, self._make_sequence_table_item(value))
+            self.sequence_table.setRowHeight(row, 38)
+        self._style_sequence_table()
+
+    def _set_sequence_remaining(self, step_no: int, text: str):
+        row = step_no - 1
+        if row < 0 or row >= self.sequence_table.rowCount():
+            return
+        item = self.sequence_table.item(row, 3)
+        if item is not None:
+            item.setText(text)
+
+    def _reset_sequence_table_remaining(self):
+        for row, step in enumerate(self.sequence_steps):
+            item = self.sequence_table.item(row, 3)
+            if item is not None:
+                item.setText(self._format_seconds(step.seconds))
+
+    def _style_sequence_table(
+        self,
+        current_step_no: int | None = None,
+        completed_until: int = 0,
+    ):
+        for row in range(self.sequence_table.rowCount()):
+            step_no = row + 1
+            if current_step_no == step_no:
+                bg = QColor(COLORS["accent"])
+                fg = QColor(COLORS["bg"])
+            elif step_no <= completed_until:
+                bg = QColor(COLORS["surface2"])
+                fg = QColor(COLORS["text_dim"])
+            else:
+                bg = QColor(COLORS["surface"])
+                fg = QColor(COLORS["text"])
+            for col in range(self.sequence_table.columnCount()):
+                item = self.sequence_table.item(row, col)
+                if item is not None:
+                    item.setBackground(bg)
+                    item.setForeground(fg)
+
     def _reset_sequence_progress(self, total_seconds: float = 0.0):
         self._sequence_progress_timer.stop()
         self._sequence_total_duration = float(total_seconds)
@@ -1310,16 +1380,18 @@ class MainWindow(QMainWindow):
         self._sequence_stage_duration = 0.0
         self._sequence_stage_start_time = None
         self._sequence_stage_number = 0
-        self.stage_time_label.setText("Этап: ожидание")
         self.stage_time_bar.setValue(0)
+        self.stage_time_bar.setFormat("Этап: ожидание")
+        self._reset_sequence_table_remaining()
+        self._style_sequence_table()
         if total_seconds > 0:
-            self.total_time_label.setText(
+            self.total_time_bar.setValue(0)
+            self.total_time_bar.setFormat(
                 f"Эксперимент: всего {self._format_seconds(total_seconds)}"
             )
-            self.total_time_bar.setValue(1000)
         else:
-            self.total_time_label.setText("Эксперимент: ожидание")
             self.total_time_bar.setValue(0)
+            self.total_time_bar.setFormat("Эксперимент: ожидание")
 
     def _begin_sequence_stage_progress(self, step_no: int, total_steps: int, seconds: float):
         now = time.monotonic()
@@ -1328,6 +1400,8 @@ class MainWindow(QMainWindow):
         self._sequence_stage_start_time = now
         self._sequence_stage_duration = float(seconds)
         self._sequence_stage_number = step_no
+        self._set_sequence_remaining(step_no - 1, "00:00")
+        self._style_sequence_table(current_step_no=step_no, completed_until=step_no - 1)
         self._sequence_progress_timer.start(200)
         self._update_sequence_progress(total_steps=total_steps)
 
@@ -1344,27 +1418,42 @@ class MainWindow(QMainWindow):
 
         stage_value = 0
         if self._sequence_stage_duration > 0:
-            stage_value = int((stage_remaining / self._sequence_stage_duration) * 1000)
+            stage_value = int(
+                (min(stage_elapsed, self._sequence_stage_duration) / self._sequence_stage_duration)
+                * 1000
+            )
         total_value = 0
         if self._sequence_total_duration > 0:
-            total_value = int((total_remaining / self._sequence_total_duration) * 1000)
+            total_value = int(
+                (min(total_elapsed, self._sequence_total_duration) / self._sequence_total_duration)
+                * 1000
+            )
 
         self.stage_time_bar.setValue(max(0, min(1000, stage_value)))
         self.total_time_bar.setValue(max(0, min(1000, total_value)))
-        self.stage_time_label.setText(
+        self.stage_time_bar.setFormat(
             f"Этап {self._sequence_stage_number}/{total_steps}: "
             f"осталось {self._format_seconds(stage_remaining)}"
         )
-        self.total_time_label.setText(
+        self.total_time_bar.setFormat(
             f"Эксперимент: осталось {self._format_seconds(total_remaining)}"
+        )
+        self._set_sequence_remaining(
+            self._sequence_stage_number,
+            self._format_seconds(stage_remaining),
         )
 
     def _finish_sequence_progress(self):
         self._sequence_progress_timer.stop()
-        self.stage_time_bar.setValue(0)
-        self.total_time_bar.setValue(0)
-        self.stage_time_label.setText("Этап: завершен")
-        self.total_time_label.setText("Эксперимент: завершен")
+        self.stage_time_bar.setValue(1000)
+        self.total_time_bar.setValue(1000)
+        self.stage_time_bar.setFormat("Этап: завершен")
+        self.total_time_bar.setFormat("Эксперимент: завершен")
+        for row in range(self.sequence_table.rowCount()):
+            item = self.sequence_table.item(row, 3)
+            if item is not None:
+                item.setText("00:00")
+        self._style_sequence_table(completed_until=len(self.sequence_steps))
         self._sequence_stage_start_time = None
         self._sequence_total_start_time = None
 
@@ -1372,8 +1461,8 @@ class MainWindow(QMainWindow):
         self._sequence_progress_timer.stop()
         if self._sequence_stage_start_time is not None:
             self._update_sequence_progress()
-            self.stage_time_label.setText(self.stage_time_label.text() + " (остановлено)")
-            self.total_time_label.setText(self.total_time_label.text() + " (остановлено)")
+            self.stage_time_bar.setFormat(self.stage_time_bar.format() + " (остановлено)")
+            self.total_time_bar.setFormat(self.total_time_bar.format() + " (остановлено)")
             self._sequence_stage_start_time = None
             self._sequence_total_start_time = None
 
@@ -1443,11 +1532,12 @@ class MainWindow(QMainWindow):
                 return False
         return True
 
-    def _set_current_stim(self, step_index: int, f1: float, f2: float):
+    def _set_current_stim(self, step_index: int, f1: float, f2: float | None):
+        f2_value = np.nan if f2 is None else float(f2)
         event = {
             "step_index": int(step_index),
             "f1_hz": float(f1),
-            "f2_hz": float(f2),
+            "f2_hz": f2_value,
             "app_timestamp": time.time(),
             "lsl_timestamp": float(local_clock()) if local_clock else np.nan,
         }
@@ -1463,7 +1553,7 @@ class MainWindow(QMainWindow):
         with self._stim_lock:
             return dict(self._current_stim)
 
-    def _begin_lsl_recording(self, step_index: int, f1: float, f2: float) -> bool:
+    def _begin_lsl_recording(self, step_index: int, f1: float, f2: float | None) -> bool:
         if self.lsl_inlet is None:
             self._log("Не удалось начать запись: LSL-поток не подключен.", COLORS["red"])
             return False
@@ -1704,21 +1794,10 @@ class MainWindow(QMainWindow):
             w.append(f"⚠ минимум до {lo:.3f} В (ограничение)")
         return "  ".join(w)
 
-    # ── Preview refresh ───────────────────────────────────────────────────────
-    def _refresh_preview(self):
+    # ── Signal stats refresh ──────────────────────────────────────────────────
+    def _refresh_signal_stats(self):
         p = self._get_params()
         self.clip_label.setText(self._check_clipping(p))
-        self.canvas.update_plot(
-            a1=p["a1"],
-            f1=p["f1"],
-            p1_deg=p["p1"],
-            a2=p["a2"],
-            f2=p["f2"],
-            p2_deg=p["p2"],
-            dc=p["dc"],
-            sr=p["sr"],
-            gain_max=p["gain_max"],
-        )
 
         t = np.linspace(0, 0.1, 50000)
         denom = np.sin(np.pi * (p["f2"] - p["f1"]) * t + np.pi / 2)
@@ -1750,7 +1829,7 @@ class MainWindow(QMainWindow):
             self._process_incoming(raw)
 
     def _process_incoming(self, raw: str):
-        """Route an unsolicited line to the console and/or telemetry chart."""
+        """Route an unsolicited line to the console and debug stat labels."""
         try:
             d = json.loads(raw)
         except json.JSONDecodeError:
@@ -1758,14 +1837,6 @@ class MainWindow(QMainWindow):
             return
 
         if d.get("dbg"):
-            # Update live telemetry chart
-            self.telem_canvas.push(
-                v=float(d.get("v", 0)),
-                env=float(d.get("env", 0)),
-                peak=float(d.get("peak", 0)),
-                trough=float(d.get("trough", 0)),
-            )
-            # Update debug stat labels
             self._total_clip_hi += int(d.get("clipHi", 0))
             self._total_clip_lo += int(d.get("clipLo", 0))
             self.dstat_isr.setText(f"{d.get('isrUs', '?')} мкс")
@@ -1832,7 +1903,6 @@ class MainWindow(QMainWindow):
 
     def _clear_console(self):
         self.console.clear()
-        self.telem_canvas.clear()
         self._total_clip_hi = 0
         self._total_clip_lo = 0
         for attr in (
@@ -1858,9 +1928,6 @@ class MainWindow(QMainWindow):
         cmd = "DBG ON" if enabled else "DBG OFF"
         self._log(f"→ {cmd}", COLORS["accent2"])
         resp = self._send(cmd)
-        if resp and "OK" in resp:
-            if not enabled:
-                self.telem_canvas.clear()
 
     # ── Serial actions ────────────────────────────────────────────────────────
     def _toggle_connect(self, checked: bool):
@@ -1887,6 +1954,8 @@ class MainWindow(QMainWindow):
                 self._set_serial_checkbox(False)
 
     def _param_changed(self):
+        if self._running and self.sequence_steps:
+            return
         if self.serial.is_open:
             self._auto_apply_timer.start(350)
 
@@ -1951,6 +2020,58 @@ class MainWindow(QMainWindow):
         self._log("Параметры применены.", COLORS["green"])
         return True
 
+    def _apply_sequence_step_params(
+        self,
+        step: SequenceStep,
+        include_static: bool,
+        header: str | None = None,
+    ) -> bool:
+        if not self.serial.is_open:
+            return False
+
+        p = self._get_params()
+        a2_cmd = "SET A2 0.0000" if step.f2 is None else f"SET A2 {p['a2']:.4f}"
+        if step.f2 is None:
+            self._sequence_a2_restore_needed = True
+
+        if include_static:
+            cmds = [
+                f"SET A1 {p['a1']:.4f}",
+                f"SET F1 {step.f1:.4f}",
+                f"SET P1 {p['p1']:.2f}",
+                a2_cmd,
+            ]
+            if step.f2 is not None:
+                cmds.append(f"SET F2 {step.f2:.4f}")
+            cmds.extend(
+                [
+                    f"SET P2 {p['p2']:.2f}",
+                    f"SET DC {p['dc']:.4f}",
+                    f"SET GM {p['gain_max']:.2f}",
+                    f"SET SR {int(p['sr'])}",
+                ]
+            )
+        else:
+            cmds = [f"SET F1 {step.f1:.4f}", a2_cmd]
+            if step.f2 is not None:
+                cmds.append(f"SET F2 {step.f2:.4f}")
+
+        if header:
+            self._log(header, COLORS["accent"])
+        for cmd in cmds:
+            self._log(f"  → {cmd}", COLORS["accent2"])
+            self._send(cmd)
+        return True
+
+    def _restore_sequence_second_signal(self):
+        if not self._sequence_a2_restore_needed or not self.serial.is_open:
+            self._sequence_a2_restore_needed = False
+            return
+        cmd = f"SET A2 {self.amp2.value():.4f}"
+        self._log(f"  → {cmd} (восстановление Синуса 2)", COLORS["accent2"])
+        self._send(cmd)
+        self._sequence_a2_restore_needed = False
+
     def _start(self):
         if self.sequence_steps:
             self._start_sequence()
@@ -1987,7 +2108,8 @@ class MainWindow(QMainWindow):
 
         self._auto_apply_timer.stop()
         self._sequence_index = 0
-        self._reset_sequence_progress(sum(step[2] for step in self.sequence_steps))
+        self._sequence_a2_restore_needed = False
+        self._reset_sequence_progress(self._sequence_total_seconds())
         self._running = True
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
@@ -2012,20 +2134,20 @@ class MainWindow(QMainWindow):
             self._finish_sequence()
             return
 
-        f1, f2, seconds = self.sequence_steps[self._sequence_index]
+        step = self.sequence_steps[self._sequence_index]
         step_no = self._sequence_index + 1
         total = len(self.sequence_steps)
+        f2_text = "выкл." if step.f2 is None else f"{step.f2:.4f} Гц"
         self._log(
-            f"[SEQ {step_no}/{total}] F1={f1:.4f} Гц  F2={f2:.4f} Гц  "
-            f"длительность={seconds:.3f} с",
+            f"[SEQ {step_no}/{total}] F1={step.f1:.4f} Гц  F2={f2_text}  "
+            f"длительность={step.seconds:.3f} с",
             COLORS["accent"],
         )
 
         if self._sequence_index == 0:
-            ok = self._apply_params(
-                include_frequencies=True,
-                f1=f1,
-                f2=f2,
+            ok = self._apply_sequence_step_params(
+                step,
+                include_static=True,
                 header="Применение параметров последовательности…",
             )
             if not ok:
@@ -2037,20 +2159,20 @@ class MainWindow(QMainWindow):
             if not resp or "OK" not in resp:
                 self._abort_sequence("команда START не подтверждена")
                 return
-            if not self._begin_lsl_recording(step_index=step_no, f1=f1, f2=f2):
+            if not self._begin_lsl_recording(step_index=step_no, f1=step.f1, f2=step.f2):
                 self._abort_sequence("LSL-запись не началась")
                 return
             if self.dbg_checkbox.isChecked():
                 self._send("DBG ON")
         else:
-            for cmd in (f"SET F1 {f1:.4f}", f"SET F2 {f2:.4f}"):
-                self._log(f"  → {cmd}", COLORS["accent2"])
-                self._send(cmd)
-            self._set_current_stim(step_no, f1, f2)
+            if not self._apply_sequence_step_params(step, include_static=False):
+                self._abort_sequence("serial-порт не подключен")
+                return
+            self._set_current_stim(step_no, step.f1, step.f2)
 
-        self._begin_sequence_stage_progress(step_no, total, seconds)
+        self._begin_sequence_stage_progress(step_no, total, step.seconds)
         self._sequence_index += 1
-        self._sequence_timer.start(max(1, int(seconds * 1000)))
+        self._sequence_timer.start(max(1, int(step.seconds * 1000)))
 
     def _finish_sequence(self):
         self._log("Последовательность завершена.", COLORS["green"])
@@ -2065,6 +2187,7 @@ class MainWindow(QMainWindow):
         if self.serial.is_open:
             self._log("→ STOP", COLORS["red"])
             self._send("STOP")
+            self._restore_sequence_second_signal()
         if self._recording_active:
             self._stop_lsl_recording(export=True)
         self._running = False
@@ -2083,6 +2206,8 @@ class MainWindow(QMainWindow):
         self._log("→ STOP", COLORS["red"])
         if self.serial.is_open:
             self._send("STOP")
+            if self.sequence_steps:
+                self._restore_sequence_second_signal()
         if self._recording_active or self.lsl_worker is not None:
             self._stop_lsl_recording(export=export)
         self._running = False

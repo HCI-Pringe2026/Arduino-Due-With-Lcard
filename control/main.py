@@ -14,7 +14,7 @@ import json
 import re
 import time
 import threading
-from collections import deque
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -73,10 +73,11 @@ from PySide6.QtWidgets import (
     QTabWidget,
     QFileDialog,
     QProgressBar,
+    QTableWidget,
+    QTableWidgetItem,
+    QHeaderView,
+    QAbstractItemView,
 )
-
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.figure import Figure
 
 # ── Palette ───────────────────────────────────────────────────────────────────
 COLORS = {
@@ -274,6 +275,37 @@ QCheckBox::indicator:checked {{
     background: {COLORS['accent']};
     border-color: {COLORS['accent']};
 }}
+QTableWidget {{
+    background-color: {COLORS['surface']};
+    border: 1px solid {COLORS['border']};
+    border-radius: 4px;
+    color: {COLORS['text']};
+    gridline-color: {COLORS['border']};
+    selection-background-color: {COLORS['surface2']};
+    selection-color: {COLORS['text']};
+    font-family: 'JetBrains Mono', 'Consolas', monospace;
+    font-size: 13px;
+}}
+QHeaderView::section {{
+    background-color: {COLORS['surface2']};
+    border: 1px solid {COLORS['border']};
+    color: {COLORS['accent']};
+    padding: 8px;
+    font-weight: bold;
+}}
+QProgressBar {{
+    background-color: {COLORS['surface2']};
+    border: 1px solid {COLORS['border']};
+    border-radius: 6px;
+    color: {COLORS['text']};
+    min-height: 34px;
+    text-align: center;
+    font-weight: bold;
+}}
+QProgressBar::chunk {{
+    background-color: {COLORS['accent']};
+    border-radius: 5px;
+}}
 """
 
 
@@ -349,386 +381,12 @@ class SerialWorker(QObject):
             return self._port is not None and self._port.is_open
 
 
-# ── Waveform canvas ───────────────────────────────────────────────────────────
-class WaveformCanvas(FigureCanvas):
-    def __init__(self):
-        self.fig = Figure(figsize=(6, 3), facecolor=COLORS["bg"])
-        super().__init__(self.fig)
-        self.ax = self.fig.add_subplot(111)
-        self._style_axes()
-        self.setMinimumHeight(180)
-
-    def _style_axes(self):
-        ax = self.ax
-        ax.set_facecolor(COLORS["surface"])
-        for spine in ax.spines.values():
-            spine.set_color(COLORS["border"])
-        ax.tick_params(colors=COLORS["text_dim"], labelsize=8)
-        ax.xaxis.label.set_color(COLORS["text_dim"])
-        ax.yaxis.label.set_color(COLORS["text_dim"])
-        ax.set_ylim(-0.1, 3.4)
-        ax.set_xlabel("время, мс", fontsize=8)
-        ax.set_ylabel("В", fontsize=8)
-        self.fig.tight_layout(pad=1.2)
-
-    def update_plot(self, a1, f1, p1_deg, a2, f2, p2_deg, dc, sr, gain_max):
-        self.ax.cla()
-        self._style_axes()
-
-        f_min = min(f1, f2) if min(f1, f2) > 0 else max(f1, f2)
-
-        # Adaptive duration: show enough periods to see the full shape.
-        # At low frequencies keep ≥3 periods visible; cap total at 50 ms for high freqs.
-        if f_min > 0:
-            period = 1.0 / f_min
-            if period < 0.005:  # f > 200 Hz  → standard 2-period view, ≤50 ms
-                duration = min(2.0 * period, 0.05)
-            elif period < 0.05:  # 20–200 Hz   → show 3 periods
-                duration = 3.0 * period
-            else:  # < 20 Hz     → show 4 periods, cap at 4 s
-                duration = min(4.0 * period, 4.0)
-        else:
-            duration = 0.05
-        t = np.linspace(0, duration, max(int(sr * duration), 2000))
-
-        p1 = np.radians(p1_deg)
-        p2 = np.radians(p2_deg)
-
-        denom = np.sin(np.pi * (f2 - f1) * t + np.pi / 2)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            env = np.where(
-                np.abs(denom) < 1e-9,
-                gain_max,
-                np.clip(np.abs(1.0 / denom), 0, gain_max),
-            )
-
-        sines = a1 * np.sin(2 * np.pi * f1 * t + p1) + a2 * np.sin(
-            2 * np.pi * f2 * t + p2
-        )
-        combined = np.clip(dc + env * sines, 0, 3.3)
-        t_ms = t * 1000
-
-        self.ax.plot(
-            t_ms,
-            dc + a1 * np.sin(2 * np.pi * f1 * t + p1),
-            color=COLORS["sine1"],
-            lw=0.8,
-            alpha=0.35,
-            label="Синус 1",
-        )
-        self.ax.plot(
-            t_ms,
-            dc + a2 * np.sin(2 * np.pi * f2 * t + p2),
-            color=COLORS["sine2"],
-            lw=0.8,
-            alpha=0.35,
-            label="Синус 2",
-        )
-
-        env_top = np.clip(dc + env * (np.abs(a1) + np.abs(a2)), 0, 3.3)
-        env_bot = np.clip(dc - env * (np.abs(a1) + np.abs(a2)), 0, 3.3)
-        self.ax.fill_between(
-            t_ms, env_bot, env_top, color=COLORS["combined"], alpha=0.07
-        )
-        self.ax.plot(
-            t_ms, env_top, color=COLORS["combined"], lw=0.6, alpha=0.4, ls="--"
-        )
-        self.ax.plot(
-            t_ms, env_bot, color=COLORS["combined"], lw=0.6, alpha=0.4, ls="--"
-        )
-        self.ax.plot(t_ms, combined, color=COLORS["combined"], lw=1.6, label="Сумма")
-
-        self.ax.axhline(3.3, color=COLORS["red"], lw=0.5, ls="--", alpha=0.5)
-        self.ax.axhline(0, color=COLORS["border"], lw=0.5, ls="--")
-        self.ax.legend(
-            loc="upper right",
-            fontsize=7,
-            facecolor=COLORS["surface"],
-            edgecolor=COLORS["border"],
-            labelcolor=COLORS["text"],
-        )
-        self.ax.set_xlabel("время, мс", fontsize=8)
-        self.ax.set_ylabel("Напряжение, В", fontsize=8)
-        self.ax.set_title(
-            f"пик {float(np.max(combined)):.3f} В  |  "
-            f"мин. {float(np.min(combined)):.3f} В  |  лимит усил. ×{gain_max:.1f}",
-            fontsize=8,
-            color=COLORS["text_dim"],
-        )
-        self.fig.tight_layout(pad=1.2)
-        self.draw()
-
-
-class SequenceCanvas(FigureCanvas):
-    def __init__(self):
-        self.fig = Figure(figsize=(6, 2.2), facecolor=COLORS["bg"])
-        super().__init__(self.fig)
-        self.ax = self.fig.add_subplot(111)
-        self.setMinimumHeight(170)
-        self._draw_empty()
-
-    def _style_axes(self):
-        ax = self.ax
-        ax.set_facecolor(COLORS["surface"])
-        for spine in ax.spines.values():
-            spine.set_color(COLORS["border"])
-        ax.tick_params(colors=COLORS["text_dim"], labelsize=8)
-        ax.xaxis.label.set_color(COLORS["text_dim"])
-        ax.yaxis.label.set_color(COLORS["text_dim"])
-        self.fig.tight_layout(pad=1.2)
-
-    def _draw_empty(self):
-        self.ax.cla()
-        self._style_axes()
-        self.ax.text(
-            0.5,
-            0.5,
-            "Загрузите файл последовательности",
-            ha="center",
-            va="center",
-            color=COLORS["text_dim"],
-            transform=self.ax.transAxes,
-            fontsize=9,
-        )
-        self.ax.set_xticks([])
-        self.ax.set_yticks([])
-        self.draw()
-
-    def update_sequence(self, steps: list[tuple[float, float, float]]):
-        if not steps:
-            self._draw_empty()
-            return
-
-        self.ax.cla()
-        self._style_axes()
-
-        starts = np.cumsum([0.0] + [step[2] for step in steps[:-1]])
-        ends = starts + np.array([step[2] for step in steps], dtype=float)
-        x = np.ravel(np.column_stack([starts, ends]))
-        f1 = np.ravel([[step[0], step[0]] for step in steps])
-        f2 = np.ravel([[step[1], step[1]] for step in steps])
-
-        self.ax.plot(x, f1, color=COLORS["sine1"], lw=1.8, label="Частота 1")
-        self.ax.plot(x, f2, color=COLORS["sine2"], lw=1.8, label="Частота 2")
-
-        for idx, (start, end) in enumerate(zip(starts, ends), 1):
-            if idx % 2 == 0:
-                self.ax.axvspan(start, end, color=COLORS["surface2"], alpha=0.35)
-            mid = (start + end) / 2
-            self.ax.text(
-                mid,
-                1.02,
-                str(idx),
-                color=COLORS["text_dim"],
-                fontsize=7,
-                ha="center",
-                va="bottom",
-                transform=self.ax.get_xaxis_transform(),
-            )
-
-        total = float(ends[-1])
-        self.ax.set_xlim(0, max(total, 1.0))
-        y_min = min(min(step[0], step[1]) for step in steps)
-        y_max = max(max(step[0], step[1]) for step in steps)
-        pad = max((y_max - y_min) * 0.08, 1.0)
-        self.ax.set_ylim(max(0, y_min - pad), y_max + pad)
-        self.ax.set_xlabel("Время, с", fontsize=8)
-        self.ax.set_ylabel("Частота, Гц", fontsize=8)
-        self.ax.set_title(
-            f"Шагов: {len(steps)}  |  длительность: {total:.3f} с",
-            fontsize=8,
-            color=COLORS["text_dim"],
-        )
-        self.ax.legend(
-            loc="upper right",
-            fontsize=7,
-            facecolor=COLORS["surface"],
-            edgecolor=COLORS["border"],
-            labelcolor=COLORS["text"],
-        )
-        self.fig.tight_layout(pad=1.2)
-        self.draw()
-
-
-# ── Debug telemetry canvas (scrolling voltage + envelope) ────────────────────
-class TelemetryCanvas(FigureCanvas):
-    """
-    Sliding-window telemetry chart using matplotlib blitting for low-overhead updates.
-
-    Strategy:
-    - Axes chrome (spines, ticks, labels, legends, static hlines) is drawn ONCE
-      and cached as a background bitmap via copy_from_bbox().
-    - On each new sample only the animated line artists are redrawn via blit(),
-      which avoids re-layouting the figure entirely.
-    - A pending-data queue fed from the serial thread is drained by a QTimer on
-      the GUI thread (no cross-thread canvas calls).
-    - The background is invalidated and redrawn whenever the widget is resized.
-    """
-
-    WINDOW = 70  # visible sliding-window width (samples)
-
-    def __init__(self):
-        self.fig = Figure(figsize=(5, 2.2), facecolor=COLORS["bg"])
-        super().__init__(self.fig)
-        self.ax_v = self.fig.add_subplot(211)
-        self.ax_env = self.fig.add_subplot(212)
-
-        self._v_buf = deque(maxlen=self.WINDOW)
-        self._env_buf = deque(maxlen=self.WINDOW)
-        self._peak_buf = deque(maxlen=self.WINDOW)
-        self._trough_buf = deque(maxlen=self.WINDOW)
-
-        # Pending data pushed from the drain thread; consumed by _flush_timer
-        self._pending: list[tuple] = []
-        self._pending_lock = threading.Lock()
-
-        self._bg_v = None  # cached background bitmaps
-        self._bg_env = None
-        self._initialized = False
-
-        self.setMinimumHeight(160)
-        self._build_static_elements()
-
-        # Flush pending data at ~20 Hz on the GUI thread
-        self._flush_timer = QTimer()
-        self._flush_timer.timeout.connect(self._flush_pending)
-        self._flush_timer.start(50)
-
-    # ── Static chrome (drawn once) ────────────────────────────────────────────
-    def _build_static_elements(self):
-        """Draw all non-animated chrome and create the animated line objects."""
-        for ax in (self.ax_v, self.ax_env):
-            ax.set_facecolor(COLORS["surface"])
-            for sp in ax.spines.values():
-                sp.set_color(COLORS["border"])
-            ax.tick_params(colors=COLORS["text_dim"], labelsize=7)
-            ax.set_xlim(0, self.WINDOW - 1)
-
-        self.ax_v.set_ylim(-0.05, 3.45)
-        self.ax_v.set_ylabel("В", fontsize=7, color=COLORS["text_dim"])
-        self.ax_v.axhline(3.3, color=COLORS["red"], lw=0.4, ls=":", alpha=0.5)
-
-        self.ax_env.set_ylabel("усил.", fontsize=7, color=COLORS["text_dim"])
-        self.ax_env.set_xlabel(
-            "отсчеты (последние 70)", fontsize=7, color=COLORS["text_dim"]
-        )
-
-        self.fig.tight_layout(pad=0.8, h_pad=0.4)
-
-        # Animated lines — created once, data updated in place
-        (self._line_v,) = self.ax_v.plot(
-            [], [], color=COLORS["combined"], lw=1.0, label="V вых.", animated=True
-        )
-        (self._line_peak,) = self.ax_v.plot(
-            [],
-            [],
-            color=COLORS["red"],
-            lw=0.6,
-            ls="--",
-            alpha=0.6,
-            label="пик",
-            animated=True,
-        )
-        (self._line_trough,) = self.ax_v.plot(
-            [],
-            [],
-            color=COLORS["sine1"],
-            lw=0.6,
-            ls="--",
-            alpha=0.6,
-            label="мин.",
-            animated=True,
-        )
-        (self._line_env,) = self.ax_env.plot(
-            [], [], color=COLORS["sine2"], lw=1.0, label="огиб.", animated=True
-        )
-
-        # Static legends (non-animated, drawn as part of background)
-        self.ax_v.legend(
-            loc="upper right",
-            fontsize=6,
-            facecolor=COLORS["surface"],
-            edgecolor=COLORS["border"],
-            labelcolor=COLORS["text"],
-        )
-        self.ax_env.legend(
-            loc="upper right",
-            fontsize=6,
-            facecolor=COLORS["surface"],
-            edgecolor=COLORS["border"],
-            labelcolor=COLORS["text"],
-        )
-
-    def _cache_background(self):
-        """Full draw then snapshot the static background for blitting."""
-        self.draw()
-        self._bg_v = self.copy_from_bbox(self.ax_v.bbox)
-        self._bg_env = self.copy_from_bbox(self.ax_env.bbox)
-        self._initialized = True
-
-    def resizeEvent(self, event):  # noqa: N802
-        super().resizeEvent(event)
-        # Invalidate cache so it gets rebuilt on next blit cycle
-        self._initialized = False
-
-    # ── Data ingestion (called from any thread) ───────────────────────────────
-    def push(self, v, env, peak, trough):
-        with self._pending_lock:
-            self._pending.append((v, env, peak, trough))
-
-    # ── GUI-thread flush ──────────────────────────────────────────────────────
-    def _flush_pending(self):
-        with self._pending_lock:
-            if not self._pending:
-                return
-            batch = self._pending
-            self._pending = []
-
-        for v, env, peak, trough in batch:
-            self._v_buf.append(v)
-            self._env_buf.append(env)
-            self._peak_buf.append(peak)
-            self._trough_buf.append(trough)
-
-        self._blit_update()
-
-    def _blit_update(self):
-        if not self._initialized:
-            self._cache_background()
-
-        x = list(range(len(self._v_buf)))
-
-        self._line_v.set_data(x, list(self._v_buf))
-        self._line_peak.set_data(x, list(self._peak_buf))
-        self._line_trough.set_data(x, list(self._trough_buf))
-        self._line_env.set_data(x, list(self._env_buf))
-
-        # Auto-scale env y-axis without full redraw
-        if self._env_buf:
-            env_max = max(self._env_buf)
-            self.ax_env.set_ylim(0, max(env_max * 1.15, 0.1))
-
-        # Restore static background, draw only the animated lines, blit
-        self.restore_region(self._bg_v)
-        self.ax_v.draw_artist(self._line_v)
-        self.ax_v.draw_artist(self._line_peak)
-        self.ax_v.draw_artist(self._line_trough)
-        self.blit(self.ax_v.bbox)
-
-        self.restore_region(self._bg_env)
-        self.ax_env.draw_artist(self._line_env)
-        self.blit(self.ax_env.bbox)
-
-    # ── Clear ─────────────────────────────────────────────────────────────────
-    def clear(self):
-        with self._pending_lock:
-            self._pending = []
-        self._v_buf.clear()
-        self._env_buf.clear()
-        self._peak_buf.clear()
-        self._trough_buf.clear()
-        self._initialized = False
-        self._cache_background()
+# ── Sequence model ────────────────────────────────────────────────────────────
+@dataclass(frozen=True)
+class SequenceStep:
+    f1: float
+    f2: float | None
+    seconds: float
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -820,7 +478,7 @@ class MainWindow(QMainWindow):
         self._console_append.connect(self._append_console)
         self._lsl_worker_error.connect(self._on_lsl_worker_error)
         self._running = False
-        self.sequence_steps: list[tuple[float, float, float]] = []
+        self.sequence_steps: list[SequenceStep] = []
         self.sequence_file_path: str | None = None
         self._sequence_index = 0
         self._sequence_timer = QTimer(self)
@@ -836,6 +494,7 @@ class MainWindow(QMainWindow):
         self._sequence_stage_duration = 0.0
         self._sequence_stage_start_time: float | None = None
         self._sequence_stage_number = 0
+        self._sequence_a2_restore_needed = False
 
         self.lsl_streams = []
         self.lsl_inlet = None
@@ -856,10 +515,10 @@ class MainWindow(QMainWindow):
         self._record_end_app_time: float | None = None
         self._build_ui()
 
-        # Preview refresh timer (4 fps — purely local math)
-        self._preview_timer = QTimer(self)
-        self._preview_timer.timeout.connect(self._refresh_preview)
-        self._preview_timer.start(250)
+        # Signal stats refresh timer (4 fps — purely local math)
+        self._stats_timer = QTimer(self)
+        self._stats_timer.timeout.connect(self._refresh_signal_stats)
+        self._stats_timer.start(250)
 
         # Telemetry drain timer — poll serial for unsolicited debug JSON
         self._drain_timer = QTimer(self)

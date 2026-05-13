@@ -11,9 +11,11 @@ Usage:
 
 import sys
 import json
+import re
 import time
 import threading
 from collections import deque
+from pathlib import Path
 
 import numpy as np
 import serial
@@ -40,6 +42,7 @@ from PySide6.QtWidgets import (
     QTextEdit,
     QLineEdit,
     QTabWidget,
+    QFileDialog,
 )
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -641,6 +644,12 @@ class MainWindow(QMainWindow):
         self.serial.message_received.connect(self._log_rx)
         self._console_append.connect(self._append_console)
         self._running = False
+        self.sequence_steps: list[tuple[float, float, float]] = []
+        self.sequence_file_path: str | None = None
+        self._sequence_index = 0
+        self._sequence_timer = QTimer(self)
+        self._sequence_timer.setSingleShot(True)
+        self._sequence_timer.timeout.connect(self._run_next_sequence_step)
         self._build_ui()
 
         # Preview refresh timer (4 fps — purely local math)
@@ -671,6 +680,7 @@ class MainWindow(QMainWindow):
         left.addWidget(self._build_connection_box())
         left.addWidget(self._build_sine_box("SINE  1", "1", COLORS["sine1"]))
         left.addWidget(self._build_sine_box("SINE  2", "2", COLORS["sine2"]))
+        left.addWidget(self._build_sequence_box())
         left.addWidget(self._build_global_box())
         left.addWidget(self._build_transport_box())
         left.addStretch()
@@ -852,6 +862,34 @@ class MainWindow(QMainWindow):
             row("Phase", self.phase2)
         return box
 
+    def _build_sequence_box(self) -> QGroupBox:
+        box = QGroupBox("SEQUENCE  FILE")
+        grid = QGridLayout(box)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(6)
+
+        self.sequence_path_edit = QLineEdit()
+        self.sequence_path_edit.setReadOnly(True)
+        self.sequence_path_edit.setPlaceholderText("No sequence file loaded")
+        grid.addWidget(self.sequence_path_edit, 0, 0, 1, 2)
+
+        self.sequence_status = QLabel("Format: F1  F2  seconds")
+        self.sequence_status.setStyleSheet(
+            f"color:{COLORS['text_dim']};font-size:10px;background-color:transparent;"
+        )
+        grid.addWidget(self.sequence_status, 1, 0, 1, 2)
+
+        self.sequence_load_btn = QPushButton("LOAD")
+        self.sequence_load_btn.clicked.connect(self._load_sequence_file)
+        grid.addWidget(self.sequence_load_btn, 2, 0)
+
+        self.sequence_clear_btn = QPushButton("CLEAR")
+        self.sequence_clear_btn.setObjectName("clear_btn")
+        self.sequence_clear_btn.clicked.connect(self._clear_sequence_file)
+        self.sequence_clear_btn.setEnabled(False)
+        grid.addWidget(self.sequence_clear_btn, 2, 1)
+        return box
+
     def _build_global_box(self) -> QGroupBox:
         box = QGroupBox("GLOBAL")
         grid = QGridLayout(box)
@@ -963,6 +1001,103 @@ class MainWindow(QMainWindow):
             "sr": self.sample_rate.value(),
             "gain_max": self.gain_max.value(),
         }
+
+    def _load_sequence_file(self):
+        if self._running:
+            self._log("Stop output before loading a sequence file.", COLORS["yellow"])
+            return
+
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load frequency sequence",
+            "",
+            "Text files (*.txt *.csv);;All files (*)",
+        )
+        if not path:
+            return
+
+        try:
+            steps = self._parse_sequence_file(path)
+        except ValueError as e:
+            self._log(f"Sequence file error: {e}", COLORS["red"])
+            self.status_bar.showMessage("Sequence file error")
+            return
+
+        self.sequence_steps = steps
+        self.sequence_file_path = path
+        self._sequence_index = 0
+        total_seconds = sum(step[2] for step in steps)
+        self.sequence_path_edit.setText(Path(path).name)
+        self.sequence_path_edit.setToolTip(path)
+        self.sequence_status.setText(
+            f"{len(steps)} steps | {total_seconds:.3f} s total | UI F1/F2 ignored"
+        )
+        self.sequence_clear_btn.setEnabled(True)
+        self._set_frequency_controls_enabled(False)
+        self._log(
+            f"Loaded sequence file: {path} ({len(steps)} steps, {total_seconds:.3f} s)",
+            COLORS["green"],
+        )
+
+    def _clear_sequence_file(self):
+        if self._running:
+            self._log("Stop output before clearing the sequence file.", COLORS["yellow"])
+            return
+        self.sequence_steps = []
+        self.sequence_file_path = None
+        self._sequence_index = 0
+        self.sequence_path_edit.clear()
+        self.sequence_path_edit.setToolTip("")
+        self.sequence_status.setText("Format: F1  F2  seconds")
+        self.sequence_clear_btn.setEnabled(False)
+        self._set_frequency_controls_enabled(True)
+        self._log("Sequence file cleared. UI F1/F2 are active again.", COLORS["text_dim"])
+
+    def _parse_sequence_file(self, path: str) -> list[tuple[float, float, float]]:
+        steps = []
+        errors = []
+        with open(path, "r", encoding="utf-8-sig") as f:
+            for line_no, raw in enumerate(f, 1):
+                line = raw.strip()
+                if not line or line.startswith("#") or line.startswith("//"):
+                    continue
+                line = re.split(r"\s+#|\s+//", line, maxsplit=1)[0].strip()
+                if not line:
+                    continue
+
+                parts = [p for p in re.split(r"[\s,;]+", line) if p]
+                if len(parts) != 3:
+                    errors.append(
+                        f"line {line_no}: expected 3 values (F1 F2 seconds), got {len(parts)}"
+                    )
+                    continue
+
+                try:
+                    f1, f2, seconds = (float(p) for p in parts)
+                except ValueError:
+                    errors.append(f"line {line_no}: values must be numbers")
+                    continue
+
+                if not (0 <= f1 <= 5000 and 0 <= f2 <= 5000):
+                    errors.append(f"line {line_no}: frequencies must be 0..5000 Hz")
+                    continue
+                if seconds <= 0:
+                    errors.append(f"line {line_no}: seconds must be greater than 0")
+                    continue
+                steps.append((f1, f2, seconds))
+
+        if errors:
+            preview = "; ".join(errors[:5])
+            if len(errors) > 5:
+                preview += f"; ... and {len(errors) - 5} more"
+            raise ValueError(preview)
+        if not steps:
+            raise ValueError("file has no sequence rows")
+        return steps
+
+    def _set_frequency_controls_enabled(self, enabled: bool):
+        for widget in (self.freq1, self.freq2):
+            widget.setEnabled(enabled)
 
     def _check_clipping(self, p: dict) -> str:
         g = p["gain_max"]
@@ -1159,29 +1294,53 @@ class MainWindow(QMainWindow):
         return resp
 
     def _apply_all(self):
+        self._apply_params(include_frequencies=not bool(self.sequence_steps))
+        if self.sequence_steps:
+            self._log(
+                "Frequency UI fields ignored because a sequence file is loaded.",
+                COLORS["text_dim"],
+            )
+
+    def _apply_params(
+        self,
+        include_frequencies: bool = True,
+        f1: float | None = None,
+        f2: float | None = None,
+        header: str = "Applying parameters…",
+    ) -> bool:
         if not self.serial.is_open:
-            return
+            return False
         p = self._get_params()
+        target_f1 = p["f1"] if f1 is None else f1
+        target_f2 = p["f2"] if f2 is None else f2
         cmds = [
             f"SET A1 {p['a1']:.4f}",
-            f"SET F1 {p['f1']:.4f}",
             f"SET P1 {p['p1']:.2f}",
             f"SET A2 {p['a2']:.4f}",
-            f"SET F2 {p['f2']:.4f}",
             f"SET P2 {p['p2']:.2f}",
             f"SET DC {p['dc']:.4f}",
             f"SET GM {p['gain_max']:.2f}",
             f"SET SR {int(p['sr'])}",
         ]
-        self._log("Applying parameters…", COLORS["accent"])
+        if include_frequencies:
+            cmds.insert(1, f"SET F1 {target_f1:.4f}")
+            cmds.insert(4, f"SET F2 {target_f2:.4f}")
+
+        self._log(header, COLORS["accent"])
         for cmd in cmds:
             self._log(f"  → {cmd}", COLORS["accent2"])
             self._send(cmd)
         self.status_bar.showMessage("Parameters applied.")
         self._log("Parameters applied.", COLORS["green"])
+        return True
 
     def _start(self):
-        self._apply_all()
+        if self.sequence_steps:
+            self._start_sequence()
+            return
+
+        if not self._apply_params():
+            return
         time.sleep(0.05)  # let Due finish ACKing all SET commands
         self._log("→ START", COLORS["green"])
         resp = self._send("START")
@@ -1195,14 +1354,103 @@ class MainWindow(QMainWindow):
             if self.dbg_checkbox.isChecked():
                 self._send("DBG ON")
 
-    def _stop(self):
-        self._log("→ STOP", COLORS["red"])
+    def _start_sequence(self):
+        if not self.serial.is_open or not self.sequence_steps:
+            return
+
+        self._sequence_index = 0
+        self._running = True
+        self.start_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.sequence_load_btn.setEnabled(False)
+        self.sequence_clear_btn.setEnabled(False)
+        name = Path(self.sequence_file_path).name if self.sequence_file_path else "sequence"
+        self.status_bar.showMessage(f"▶ Running sequence: {name}")
+        self._log(
+            f"Starting sequence: {name} ({len(self.sequence_steps)} steps)",
+            COLORS["green"],
+        )
+        self._run_next_sequence_step()
+
+    def _run_next_sequence_step(self):
+        if not self._running:
+            return
+        if not self.serial.is_open:
+            self._abort_sequence("serial port disconnected")
+            return
+
+        if self._sequence_index >= len(self.sequence_steps):
+            self._finish_sequence()
+            return
+
+        f1, f2, seconds = self.sequence_steps[self._sequence_index]
+        step_no = self._sequence_index + 1
+        total = len(self.sequence_steps)
+        self._log(
+            f"[SEQ {step_no}/{total}] F1={f1:.4f} Hz  F2={f2:.4f} Hz  "
+            f"duration={seconds:.3f} s",
+            COLORS["accent"],
+        )
+
+        if self._sequence_index == 0:
+            ok = self._apply_params(
+                include_frequencies=True,
+                f1=f1,
+                f2=f2,
+                header="Applying sequence parameters…",
+            )
+            if not ok:
+                self._abort_sequence("serial port is not connected")
+                return
+            time.sleep(0.05)  # let Due finish ACKing all SET commands
+            self._log("→ START", COLORS["green"])
+            resp = self._send("START")
+            if not resp or "OK" not in resp:
+                self._abort_sequence("START was not acknowledged")
+                return
+            if self.dbg_checkbox.isChecked():
+                self._send("DBG ON")
+        else:
+            for cmd in (f"SET F1 {f1:.4f}", f"SET F2 {f2:.4f}"):
+                self._log(f"  → {cmd}", COLORS["accent2"])
+                self._send(cmd)
+
+        self._sequence_index += 1
+        self._sequence_timer.start(max(1, int(seconds * 1000)))
+
+    def _finish_sequence(self):
+        self._log("Sequence complete.", COLORS["green"])
+        self._stop()
+        self.status_bar.showMessage("Sequence complete")
+
+    def _abort_sequence(self, reason: str):
+        self._log(f"Sequence aborted: {reason}.", COLORS["red"])
+        self._sequence_timer.stop()
+        if self.serial.is_open:
+            self._log("→ STOP", COLORS["red"])
+            self._send("STOP")
         self._running = False
-        self.start_btn.setEnabled(True)
+        self._sequence_index = 0
+        self.start_btn.setEnabled(self.serial.is_open)
         self.stop_btn.setEnabled(False)
+        self.sequence_load_btn.setEnabled(True)
+        self.sequence_clear_btn.setEnabled(bool(self.sequence_steps))
+        self.status_bar.showMessage(f"Sequence aborted: {reason}")
+
+    def _stop(self):
+        self._sequence_timer.stop()
+        self._log("→ STOP", COLORS["red"])
+        if self.serial.is_open:
+            self._send("STOP")
+        self._running = False
+        self._sequence_index = 0
+        self.start_btn.setEnabled(self.serial.is_open)
+        self.stop_btn.setEnabled(False)
+        self.sequence_load_btn.setEnabled(True)
+        self.sequence_clear_btn.setEnabled(bool(self.sequence_steps))
         self.status_bar.showMessage("■ Stopped")
         self._log("■ Stopped", COLORS["red"])
-        if self.dbg_checkbox.isChecked():
+        if self.dbg_checkbox.isChecked() and self.serial.is_open:
             self._send("DBG OFF")
 
     # ── Connected slot ────────────────────────────────────────────────────────
@@ -1214,10 +1462,13 @@ class MainWindow(QMainWindow):
             self.start_btn.setEnabled(True)
             self.stop_btn.setEnabled(False)
         else:
+            self._sequence_timer.stop()
             self.connect_btn.setText("CONNECT")
             self.apply_btn.setEnabled(False)
             self.start_btn.setEnabled(False)
             self.stop_btn.setEnabled(False)
+            self.sequence_load_btn.setEnabled(True)
+            self.sequence_clear_btn.setEnabled(bool(self.sequence_steps))
             self._running = False
 
     @Slot(str)

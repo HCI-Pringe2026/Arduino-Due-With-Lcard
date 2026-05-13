@@ -50,7 +50,7 @@ except Exception as e:  # pragma: no cover - depends on local installation
     butter = filtfilt = iirnotch = lfilter = sosfilt = sosfiltfilt = None
     SCIPY_IMPORT_ERROR = e
 
-from PySide6.QtCore import QTimer, Signal, QObject, Slot
+from PySide6.QtCore import QTimer, Signal, QObject, Slot, Qt
 from PySide6.QtGui import QColor, QPalette, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
@@ -1035,14 +1035,16 @@ class MainWindow(QMainWindow):
         self.lsl_stream_combo = QComboBox()
         self.lsl_stream_combo.setMinimumWidth(360)
         self.lsl_stream_combo.currentIndexChanged.connect(self._update_lsl_stream_preview)
+        self.lsl_stream_combo.activated.connect(self._connect_selected_lsl_stream)
         stream_grid.addWidget(self.lsl_stream_combo, 0, 0, 1, 3)
 
         self.lsl_refresh_btn = QPushButton("ОБНОВИТЬ")
         self.lsl_refresh_btn.clicked.connect(self._refresh_lsl_streams)
         stream_grid.addWidget(self.lsl_refresh_btn, 1, 0)
 
-        self.lsl_connect_check = QCheckBox("Подключено")
-        self.lsl_connect_check.toggled.connect(self._toggle_lsl_connection)
+        self.lsl_connect_check = QCheckBox("Отключено")
+        self.lsl_connect_check.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.lsl_connect_check.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         stream_grid.addWidget(self.lsl_connect_check, 1, 1, 1, 2)
 
         self.lsl_status_label = QLabel("Отключено")
@@ -1116,6 +1118,7 @@ class MainWindow(QMainWindow):
 
         self.port_combo = QComboBox()
         self._refresh_ports()
+        self.port_combo.activated.connect(self._connect_selected_serial_port)
         lay.addWidget(self.port_combo)
 
         refresh_btn = QPushButton("⟳")
@@ -1123,8 +1126,9 @@ class MainWindow(QMainWindow):
         refresh_btn.clicked.connect(self._refresh_ports)
         lay.addWidget(refresh_btn)
 
-        self.serial_connect_check = QCheckBox("Подключено")
-        self.serial_connect_check.toggled.connect(self._toggle_connect)
+        self.serial_connect_check = QCheckBox("Отключено")
+        self.serial_connect_check.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.serial_connect_check.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         lay.addWidget(self.serial_connect_check)
         return box
 
@@ -1310,6 +1314,28 @@ class MainWindow(QMainWindow):
         if not ports:
             self.port_combo.addItem("(порты не найдены)")
 
+    def _connect_selected_serial_port(self, idx: int | None = None):
+        port = self.port_combo.currentText()
+        if not port or "no ports" in port or "порты не найдены" in port:
+            self._log("Serial-порт не выбран.", COLORS["yellow"])
+            self._set_serial_checkbox(False)
+            return
+
+        if self.serial.is_open:
+            if self._running or self._recording_active:
+                self._stop(reason="Serial переключен")
+            else:
+                self.serial.close()
+
+        self.status_bar.showMessage(f"Подключение к {port} …")
+        self._log(f"Подключение к {port} @ 115200 …", COLORS["accent"])
+        ok = self.serial.open(port)
+        if ok:
+            self.status_bar.showMessage(f"Подключено  ·  {port}  @  115200 бод")
+            self._log(f"Подключено к {port}.", COLORS["green"])
+        else:
+            self._set_serial_checkbox(False)
+
     # ── LSL helpers ──────────────────────────────────────────────────────────
     def _refresh_lsl_streams(self):
         self.lsl_stream_combo.clear()
@@ -1407,6 +1433,11 @@ class MainWindow(QMainWindow):
         )
         self._log(f"LSL-поток подключен: {self.lsl_stream_meta['name']}", COLORS["green"])
 
+    def _connect_selected_lsl_stream(self, idx: int | None = None):
+        if self.lsl_inlet is not None:
+            self._disconnect_lsl_stream()
+        self._connect_lsl_stream()
+
     def _disconnect_lsl_stream(self):
         if self._recording_active or self._running:
             self._log("LSL отключен во время эксперимента.", COLORS["red"])
@@ -1434,7 +1465,8 @@ class MainWindow(QMainWindow):
     def _set_lsl_checkbox(self, checked: bool, enabled: bool = True):
         self.lsl_connect_check.blockSignals(True)
         self.lsl_connect_check.setChecked(checked)
-        self.lsl_connect_check.setEnabled(enabled)
+        self.lsl_connect_check.setText("Подключено" if checked else "Отключено")
+        self.lsl_connect_check.setEnabled(True)
         self.lsl_connect_check.blockSignals(False)
 
     def _read_lsl_stream_meta(self, info) -> dict:
@@ -2210,6 +2242,7 @@ class MainWindow(QMainWindow):
     def _set_serial_checkbox(self, checked: bool):
         self.serial_connect_check.blockSignals(True)
         self.serial_connect_check.setChecked(checked)
+        self.serial_connect_check.setText("Подключено" if checked else "Отключено")
         self.serial_connect_check.blockSignals(False)
 
     def _send(self, cmd: str) -> str | None:
@@ -2460,7 +2493,7 @@ def main():
     app.setStyleSheet(STYLE)
 
     win = MainWindow()
-    win.show()
+    win.showMaximized()
     sys.exit(app.exec())
 
 

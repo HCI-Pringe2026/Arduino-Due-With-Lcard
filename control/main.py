@@ -3,7 +3,7 @@ dual_sine_controller.py
 PySide6 desktop app for controlling the Arduino Due dual-sine DAC firmware.
 
 Requirements:
-    pip install PySide6 pyserial numpy matplotlib pylsl pandas openpyxl scipy
+    pip install PySide6 pyserial numpy matplotlib pylsl pandas scipy
 
 Usage:
     python dual_sine_controller.py
@@ -43,13 +43,6 @@ except Exception as e:  # pragma: no cover - depends on local installation
     PANDAS_IMPORT_ERROR = e
 
 try:
-    import openpyxl as _openpyxl  # noqa: F401
-
-    OPENPYXL_IMPORT_ERROR = None
-except Exception as e:  # pragma: no cover - depends on local installation
-    OPENPYXL_IMPORT_ERROR = e
-
-try:
     from scipy.signal import butter, filtfilt, iirnotch, lfilter, sosfilt, sosfiltfilt
 
     SCIPY_IMPORT_ERROR = None
@@ -79,6 +72,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QTabWidget,
     QFileDialog,
+    QProgressBar,
 )
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -200,13 +194,6 @@ QPushButton#stop_btn:disabled {{
     border-color: {COLORS['border']};
     color: {COLORS['text_dim']};
 }}
-QPushButton#connect_btn {{
-    background-color: #162a3a;
-    border-color: {COLORS['accent']};
-    color: {COLORS['accent']};
-}}
-QPushButton#connect_btn:hover {{ background-color: #1e3a4d; }}
-QPushButton#connect_btn:pressed {{ background-color: #0f1f2e; border-color: {COLORS['accent']}; }}
 QPushButton#clear_btn {{
     background-color: {COLORS['surface2']};
     border-color: {COLORS['border']};
@@ -839,6 +826,16 @@ class MainWindow(QMainWindow):
         self._sequence_timer = QTimer(self)
         self._sequence_timer.setSingleShot(True)
         self._sequence_timer.timeout.connect(self._run_next_sequence_step)
+        self._sequence_progress_timer = QTimer(self)
+        self._sequence_progress_timer.timeout.connect(self._update_sequence_progress)
+        self._auto_apply_timer = QTimer(self)
+        self._auto_apply_timer.setSingleShot(True)
+        self._auto_apply_timer.timeout.connect(self._auto_apply_params)
+        self._sequence_total_duration = 0.0
+        self._sequence_total_start_time: float | None = None
+        self._sequence_stage_duration = 0.0
+        self._sequence_stage_start_time: float | None = None
+        self._sequence_stage_number = 0
 
         self.lsl_streams = []
         self.lsl_inlet = None
@@ -1044,14 +1041,9 @@ class MainWindow(QMainWindow):
         self.lsl_refresh_btn.clicked.connect(self._refresh_lsl_streams)
         stream_grid.addWidget(self.lsl_refresh_btn, 1, 0)
 
-        self.lsl_connect_btn = QPushButton("ПОДКЛЮЧИТЬ")
-        self.lsl_connect_btn.clicked.connect(self._connect_lsl_stream)
-        stream_grid.addWidget(self.lsl_connect_btn, 1, 1)
-
-        self.lsl_disconnect_btn = QPushButton("ОТКЛЮЧИТЬ")
-        self.lsl_disconnect_btn.clicked.connect(self._disconnect_lsl_stream)
-        self.lsl_disconnect_btn.setEnabled(False)
-        stream_grid.addWidget(self.lsl_disconnect_btn, 1, 2)
+        self.lsl_connect_check = QCheckBox("Подключено")
+        self.lsl_connect_check.toggled.connect(self._toggle_lsl_connection)
+        stream_grid.addWidget(self.lsl_connect_check, 1, 1, 1, 2)
 
         self.lsl_status_label = QLabel("Отключено")
         self.lsl_status_label.setStyleSheet(
@@ -1107,7 +1099,7 @@ class MainWindow(QMainWindow):
         )
         filter_grid.addWidget(self.recording_status_label, 4, 0, 1, 4)
 
-        self.export_last_btn = QPushButton("ЭКСПОРТ ПОСЛЕДНЕЙ ЗАПИСИ")
+        self.export_last_btn = QPushButton("ЭКСПОРТ ПОСЛЕДНЕЙ ЗАПИСИ В TXT")
         self.export_last_btn.clicked.connect(self._export_lsl_recording)
         self.export_last_btn.setEnabled(False)
         filter_grid.addWidget(self.export_last_btn, 5, 0, 1, 4)
@@ -1131,10 +1123,9 @@ class MainWindow(QMainWindow):
         refresh_btn.clicked.connect(self._refresh_ports)
         lay.addWidget(refresh_btn)
 
-        self.connect_btn = QPushButton("ПОДКЛЮЧИТЬ")
-        self.connect_btn.setObjectName("connect_btn")
-        self.connect_btn.clicked.connect(self._toggle_connect)
-        lay.addWidget(self.connect_btn)
+        self.serial_connect_check = QCheckBox("Подключено")
+        self.serial_connect_check.toggled.connect(self._toggle_connect)
+        lay.addWidget(self.serial_connect_check)
         return box
 
     def _build_sine_box(self, title: str, idx: str, color: str) -> QGroupBox:
@@ -1190,15 +1181,39 @@ class MainWindow(QMainWindow):
         )
         grid.addWidget(self.sequence_status, 1, 0, 1, 2)
 
+        self.stage_time_label = QLabel("Этап: ожидание")
+        self.stage_time_label.setStyleSheet(
+            f"color:{COLORS['text_dim']};font-size:10px;background-color:transparent;"
+        )
+        grid.addWidget(self.stage_time_label, 2, 0, 1, 2)
+
+        self.stage_time_bar = QProgressBar()
+        self.stage_time_bar.setRange(0, 1000)
+        self.stage_time_bar.setValue(0)
+        self.stage_time_bar.setTextVisible(False)
+        grid.addWidget(self.stage_time_bar, 3, 0, 1, 2)
+
+        self.total_time_label = QLabel("Эксперимент: ожидание")
+        self.total_time_label.setStyleSheet(
+            f"color:{COLORS['text_dim']};font-size:10px;background-color:transparent;"
+        )
+        grid.addWidget(self.total_time_label, 4, 0, 1, 2)
+
+        self.total_time_bar = QProgressBar()
+        self.total_time_bar.setRange(0, 1000)
+        self.total_time_bar.setValue(0)
+        self.total_time_bar.setTextVisible(False)
+        grid.addWidget(self.total_time_bar, 5, 0, 1, 2)
+
         self.sequence_load_btn = QPushButton("ЗАГРУЗИТЬ")
         self.sequence_load_btn.clicked.connect(self._load_sequence_file)
-        grid.addWidget(self.sequence_load_btn, 2, 0)
+        grid.addWidget(self.sequence_load_btn, 6, 0)
 
         self.sequence_clear_btn = QPushButton("СБРОС")
         self.sequence_clear_btn.setObjectName("clear_btn")
         self.sequence_clear_btn.clicked.connect(self._clear_sequence_file)
         self.sequence_clear_btn.setEnabled(False)
-        grid.addWidget(self.sequence_clear_btn, 2, 1)
+        grid.addWidget(self.sequence_clear_btn, 6, 1)
         return box
 
     def _build_global_box(self) -> QGroupBox:
@@ -1243,10 +1258,6 @@ class MainWindow(QMainWindow):
         lay = QHBoxLayout(box)
         lay.setSpacing(8)
 
-        self.apply_btn = QPushButton("ПРИМЕНИТЬ")
-        self.apply_btn.clicked.connect(self._apply_all)
-        self.apply_btn.setEnabled(False)
-
         self.start_btn = QPushButton("▶  СТАРТ")
         self.start_btn.setObjectName("start_btn")
         self.start_btn.clicked.connect(self._start)
@@ -1257,7 +1268,6 @@ class MainWindow(QMainWindow):
         self.stop_btn.clicked.connect(self._stop)
         self.stop_btn.setEnabled(False)
 
-        lay.addWidget(self.apply_btn)
         lay.addWidget(self.start_btn)
         lay.addWidget(self.stop_btn)
         return box
@@ -1309,7 +1319,7 @@ class MainWindow(QMainWindow):
             msg = f"pylsl недоступен: {LSL_IMPORT_ERROR}"
             self.lsl_stream_combo.addItem("(pylsl недоступен)")
             self.lsl_status_label.setText(msg)
-            self.lsl_connect_btn.setEnabled(False)
+            self._set_lsl_checkbox(False, enabled=False)
             self.lsl_meta_text.setPlainText(msg)
             return
 
@@ -1320,13 +1330,13 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.lsl_status_label.setText(f"Ошибка обновления LSL: {e}")
             self._log(f"Ошибка обновления LSL: {e}", COLORS["red"])
-            self.lsl_connect_btn.setEnabled(False)
+            self._set_lsl_checkbox(False, enabled=False)
             return
 
         if not self.lsl_streams:
             self.lsl_stream_combo.addItem("(LSL-потоки не найдены)")
             self.lsl_status_label.setText("LSL-потоки не найдены")
-            self.lsl_connect_btn.setEnabled(False)
+            self._set_lsl_checkbox(False, enabled=False)
             self.lsl_meta_text.clear()
             return
 
@@ -1337,7 +1347,7 @@ class MainWindow(QMainWindow):
                 f"{meta['channel_count']} кан. | {meta['nominal_srate_hz']} Гц"
             )
         self.lsl_status_label.setText(f"Найдено LSL-потоков: {len(self.lsl_streams)}")
-        self.lsl_connect_btn.setEnabled(self.lsl_inlet is None)
+        self._set_lsl_checkbox(self.lsl_inlet is not None, enabled=True)
         self._update_lsl_stream_preview()
 
     def _update_lsl_stream_preview(self):
@@ -1364,10 +1374,12 @@ class MainWindow(QMainWindow):
     def _connect_lsl_stream(self):
         if StreamInlet is None:
             self._log(f"Не удалось подключить LSL: {LSL_IMPORT_ERROR}", COLORS["red"])
+            self._set_lsl_checkbox(False, enabled=False)
             return
         idx = self.lsl_stream_combo.currentIndex()
         if idx < 0 or idx >= len(self.lsl_streams):
             self._log("Сначала выберите LSL-поток.", COLORS["yellow"])
+            self._set_lsl_checkbox(False, enabled=bool(self.lsl_streams))
             return
 
         try:
@@ -1383,10 +1395,10 @@ class MainWindow(QMainWindow):
             self.lsl_channel_names = []
             self._log(f"Ошибка подключения LSL: {e}", COLORS["red"])
             self.lsl_status_label.setText(f"Ошибка подключения LSL: {e}")
+            self._set_lsl_checkbox(False, enabled=True)
             return
 
-        self.lsl_connect_btn.setEnabled(False)
-        self.lsl_disconnect_btn.setEnabled(True)
+        self._set_lsl_checkbox(True, enabled=True)
         self.lsl_refresh_btn.setEnabled(False)
         self.lsl_status_label.setText(
             f"Подключено: {self.lsl_stream_meta['name']} | "
@@ -1408,11 +1420,22 @@ class MainWindow(QMainWindow):
         self.lsl_inlet = None
         self.lsl_stream_meta = {}
         self.lsl_channel_names = []
-        self.lsl_connect_btn.setEnabled(bool(self.lsl_streams))
-        self.lsl_disconnect_btn.setEnabled(False)
+        self._set_lsl_checkbox(False, enabled=bool(self.lsl_streams))
         self.lsl_refresh_btn.setEnabled(True)
         self.lsl_status_label.setText("Отключено")
         self._log("LSL-поток отключен.", COLORS["text_dim"])
+
+    def _toggle_lsl_connection(self, checked: bool):
+        if checked:
+            self._connect_lsl_stream()
+        else:
+            self._disconnect_lsl_stream()
+
+    def _set_lsl_checkbox(self, checked: bool, enabled: bool = True):
+        self.lsl_connect_check.blockSignals(True)
+        self.lsl_connect_check.setChecked(checked)
+        self.lsl_connect_check.setEnabled(enabled)
+        self.lsl_connect_check.blockSignals(False)
 
     def _read_lsl_stream_meta(self, info) -> dict:
         def read(method_name: str, default):
@@ -1511,6 +1534,7 @@ class MainWindow(QMainWindow):
         self.sequence_clear_btn.setEnabled(True)
         self._set_frequency_controls_enabled(False)
         self.sequence_canvas.update_sequence(steps)
+        self._reset_sequence_progress(total_seconds)
         self.tabs.setCurrentIndex(0)
         self._log(
             f"Файл частот загружен: {path} ({len(steps)} шагов, {total_seconds:.3f} с)",
@@ -1530,6 +1554,7 @@ class MainWindow(QMainWindow):
         self.sequence_clear_btn.setEnabled(False)
         self._set_frequency_controls_enabled(True)
         self.sequence_canvas.update_sequence([])
+        self._reset_sequence_progress()
         self._log("Файл частот сброшен. Поля F1/F2 снова активны.", COLORS["text_dim"])
 
     def _parse_sequence_file(self, path: str) -> list[tuple[float, float, float]]:
@@ -1578,6 +1603,89 @@ class MainWindow(QMainWindow):
         for widget in (self.freq1, self.freq2):
             widget.setEnabled(enabled)
 
+    def _format_seconds(self, seconds: float) -> str:
+        seconds = max(0.0, float(seconds))
+        total = int(round(seconds))
+        hours, rem = divmod(total, 3600)
+        minutes, secs = divmod(rem, 60)
+        if hours:
+            return f"{hours:d}:{minutes:02d}:{secs:02d}"
+        return f"{minutes:02d}:{secs:02d}"
+
+    def _reset_sequence_progress(self, total_seconds: float = 0.0):
+        self._sequence_progress_timer.stop()
+        self._sequence_total_duration = float(total_seconds)
+        self._sequence_total_start_time = None
+        self._sequence_stage_duration = 0.0
+        self._sequence_stage_start_time = None
+        self._sequence_stage_number = 0
+        self.stage_time_label.setText("Этап: ожидание")
+        self.stage_time_bar.setValue(0)
+        if total_seconds > 0:
+            self.total_time_label.setText(
+                f"Эксперимент: всего {self._format_seconds(total_seconds)}"
+            )
+            self.total_time_bar.setValue(1000)
+        else:
+            self.total_time_label.setText("Эксперимент: ожидание")
+            self.total_time_bar.setValue(0)
+
+    def _begin_sequence_stage_progress(self, step_no: int, total_steps: int, seconds: float):
+        now = time.monotonic()
+        if self._sequence_total_start_time is None:
+            self._sequence_total_start_time = now
+        self._sequence_stage_start_time = now
+        self._sequence_stage_duration = float(seconds)
+        self._sequence_stage_number = step_no
+        self._sequence_progress_timer.start(200)
+        self._update_sequence_progress(total_steps=total_steps)
+
+    def _update_sequence_progress(self, total_steps: int | None = None):
+        if self._sequence_stage_start_time is None or self._sequence_total_start_time is None:
+            return
+
+        now = time.monotonic()
+        stage_elapsed = now - self._sequence_stage_start_time
+        stage_remaining = max(0.0, self._sequence_stage_duration - stage_elapsed)
+        total_elapsed = now - self._sequence_total_start_time
+        total_remaining = max(0.0, self._sequence_total_duration - total_elapsed)
+        total_steps = total_steps or len(self.sequence_steps)
+
+        stage_value = 0
+        if self._sequence_stage_duration > 0:
+            stage_value = int((stage_remaining / self._sequence_stage_duration) * 1000)
+        total_value = 0
+        if self._sequence_total_duration > 0:
+            total_value = int((total_remaining / self._sequence_total_duration) * 1000)
+
+        self.stage_time_bar.setValue(max(0, min(1000, stage_value)))
+        self.total_time_bar.setValue(max(0, min(1000, total_value)))
+        self.stage_time_label.setText(
+            f"Этап {self._sequence_stage_number}/{total_steps}: "
+            f"осталось {self._format_seconds(stage_remaining)}"
+        )
+        self.total_time_label.setText(
+            f"Эксперимент: осталось {self._format_seconds(total_remaining)}"
+        )
+
+    def _finish_sequence_progress(self):
+        self._sequence_progress_timer.stop()
+        self.stage_time_bar.setValue(0)
+        self.total_time_bar.setValue(0)
+        self.stage_time_label.setText("Этап: завершен")
+        self.total_time_label.setText("Эксперимент: завершен")
+        self._sequence_stage_start_time = None
+        self._sequence_total_start_time = None
+
+    def _stop_sequence_progress(self):
+        self._sequence_progress_timer.stop()
+        if self._sequence_stage_start_time is not None:
+            self._update_sequence_progress()
+            self.stage_time_label.setText(self.stage_time_label.text() + " (остановлено)")
+            self.total_time_label.setText(self.total_time_label.text() + " (остановлено)")
+            self._sequence_stage_start_time = None
+            self._sequence_total_start_time = None
+
     def _get_filter_config(self) -> dict:
         return {
             "bandpass_enabled": self.bandpass_enabled.isChecked(),
@@ -1598,7 +1706,6 @@ class MainWindow(QMainWindow):
         missing = []
         for name, err in (
             ("pandas", PANDAS_IMPORT_ERROR),
-            ("openpyxl", OPENPYXL_IMPORT_ERROR),
             ("scipy", SCIPY_IMPORT_ERROR),
         ):
             if err is not None:
@@ -1742,23 +1849,23 @@ class MainWindow(QMainWindow):
             self._log("Нет LSL-данных для экспорта.", COLORS["yellow"])
             return
 
-        default_name = f"experiment_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        default_name = f"experiment_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Сохранить экспорт эксперимента",
             str(Path.cwd() / default_name),
-            "Книга Excel (*.xlsx)",
+            "Текстовый файл (*.txt)",
         )
         if not path:
             self._log("Экспорт отменен. Запись остается в памяти до следующего старта.", COLORS["yellow"])
             self.status_bar.showMessage("Экспорт отменен")
             return
-        if not path.lower().endswith(".xlsx"):
-            path += ".xlsx"
+        if not path.lower().endswith(".txt"):
+            path += ".txt"
 
         try:
             data_df, metadata_df = self._build_export_frames(records)
-            self._write_xlsx_export(path, data_df, metadata_df)
+            self._write_txt_export(path, data_df, metadata_df)
         except Exception as e:
             self._log(f"Ошибка экспорта: {e}", COLORS["red"])
             self.status_bar.showMessage(f"Ошибка экспорта: {e}")
@@ -1888,16 +1995,12 @@ class MainWindow(QMainWindow):
             return (len(stamps) - 1) / (stamps[-1] - stamps[0])
         return nominal_fs
 
-    def _write_xlsx_export(self, path: str, data_df, metadata_df):
-        rows_per_sheet = 1_048_000
-        with pd.ExcelWriter(path, engine="openpyxl") as writer:
-            if len(data_df) <= rows_per_sheet:
-                data_df.to_excel(writer, sheet_name="data", index=False)
-            else:
-                for sheet_idx, start in enumerate(range(0, len(data_df), rows_per_sheet), 1):
-                    chunk = data_df.iloc[start : start + rows_per_sheet]
-                    chunk.to_excel(writer, sheet_name=f"data_{sheet_idx}", index=False)
-            metadata_df.to_excel(writer, sheet_name="metadata", index=False)
+    def _write_txt_export(self, path: str, data_df, metadata_df):
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write("# METADATA\n")
+            metadata_df.to_csv(f, sep="\t", index=False, lineterminator="\n")
+            f.write("\n# DATA\n")
+            data_df.to_csv(f, sep="\t", index=False, lineterminator="\n")
 
     def _check_clipping(self, p: dict) -> str:
         g = p["gain_max"]
@@ -2069,8 +2172,11 @@ class MainWindow(QMainWindow):
                 self.telem_canvas.clear()
 
     # ── Serial actions ────────────────────────────────────────────────────────
-    def _toggle_connect(self):
-        if self.serial.is_open:
+    def _toggle_connect(self, checked: bool):
+        if not checked:
+            if not self.serial.is_open:
+                self._set_serial_checkbox(False)
+                return
             self._stop()
             self.serial.close()
             self._log("Отключено.", COLORS["text_dim"])
@@ -2083,9 +2189,28 @@ class MainWindow(QMainWindow):
                 if ok:
                     self.status_bar.showMessage(f"Подключено  ·  {port}  @  115200 бод")
                     self._log(f"Подключено к {port}.", COLORS["green"])
+                else:
+                    self._set_serial_checkbox(False)
+            else:
+                self._log("Serial-порт не выбран.", COLORS["yellow"])
+                self._set_serial_checkbox(False)
 
     def _param_changed(self):
-        pass  # preview updates via timer; board updated only on APPLY
+        if self.serial.is_open:
+            self._auto_apply_timer.start(350)
+
+    def _auto_apply_params(self):
+        if not self.serial.is_open:
+            return
+        self._apply_params(
+            include_frequencies=not bool(self.sequence_steps),
+            header="Автоприменение параметров…",
+        )
+
+    def _set_serial_checkbox(self, checked: bool):
+        self.serial_connect_check.blockSignals(True)
+        self.serial_connect_check.setChecked(checked)
+        self.serial_connect_check.blockSignals(False)
 
     def _send(self, cmd: str) -> str | None:
         resp = self.serial.send(cmd)
@@ -2142,6 +2267,7 @@ class MainWindow(QMainWindow):
         if not self._validate_lsl_recording_ready():
             return
 
+        self._auto_apply_timer.stop()
         if not self._apply_params():
             return
         time.sleep(0.05)  # let Due finish ACKing all SET commands
@@ -2167,7 +2293,9 @@ class MainWindow(QMainWindow):
         if not self._validate_lsl_recording_ready():
             return
 
+        self._auto_apply_timer.stop()
         self._sequence_index = 0
+        self._reset_sequence_progress(sum(step[2] for step in self.sequence_steps))
         self._running = True
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
@@ -2228,17 +2356,20 @@ class MainWindow(QMainWindow):
                 self._send(cmd)
             self._set_current_stim(step_no, f1, f2)
 
+        self._begin_sequence_stage_progress(step_no, total, seconds)
         self._sequence_index += 1
         self._sequence_timer.start(max(1, int(seconds * 1000)))
 
     def _finish_sequence(self):
         self._log("Последовательность завершена.", COLORS["green"])
         self._stop()
+        self._finish_sequence_progress()
         self.status_bar.showMessage("Последовательность завершена")
 
     def _abort_sequence(self, reason: str):
         self._log(f"Последовательность прервана: {reason}.", COLORS["red"])
         self._sequence_timer.stop()
+        self._stop_sequence_progress()
         if self.serial.is_open:
             self._log("→ STOP", COLORS["red"])
             self._send("STOP")
@@ -2254,6 +2385,9 @@ class MainWindow(QMainWindow):
 
     def _stop(self, checked=False, export: bool = True, reason: str = "Остановлено"):
         self._sequence_timer.stop()
+        self._auto_apply_timer.stop()
+        if self.sequence_steps:
+            self._stop_sequence_progress()
         self._log("→ STOP", COLORS["red"])
         if self.serial.is_open:
             self._send("STOP")
@@ -2274,16 +2408,15 @@ class MainWindow(QMainWindow):
     @Slot(bool)
     def _on_connected(self, connected: bool):
         if connected:
-            self.connect_btn.setText("ОТКЛЮЧИТЬ")
-            self.apply_btn.setEnabled(True)
+            self._set_serial_checkbox(True)
             self.start_btn.setEnabled(True)
             self.stop_btn.setEnabled(False)
+            self._auto_apply_timer.start(200)
         else:
             if self._running or self._recording_active:
                 self._stop(reason="Serial отключен")
             self._sequence_timer.stop()
-            self.connect_btn.setText("ПОДКЛЮЧИТЬ")
-            self.apply_btn.setEnabled(False)
+            self._set_serial_checkbox(False)
             self.start_btn.setEnabled(False)
             self.stop_btn.setEnabled(False)
             self.sequence_load_btn.setEnabled(True)

@@ -3,7 +3,7 @@ dual_sine_controller.py
 PySide6 desktop app for controlling the Arduino Due dual-sine DAC firmware.
 
 Requirements:
-    pip install PySide6 pyserial numpy matplotlib
+    pip install PySide6 pyserial numpy matplotlib pylsl pandas openpyxl scipy
 
 Usage:
     python dual_sine_controller.py
@@ -15,11 +15,47 @@ import re
 import time
 import threading
 from collections import deque
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import serial
 import serial.tools.list_ports
+
+try:
+    import pylsl
+    from pylsl import StreamInlet, local_clock, resolve_streams
+
+    LSL_IMPORT_ERROR = None
+except Exception as e:  # pragma: no cover - depends on local installation
+    pylsl = None
+    StreamInlet = None
+    local_clock = None
+    resolve_streams = None
+    LSL_IMPORT_ERROR = e
+
+try:
+    import pandas as pd
+
+    PANDAS_IMPORT_ERROR = None
+except Exception as e:  # pragma: no cover - depends on local installation
+    pd = None
+    PANDAS_IMPORT_ERROR = e
+
+try:
+    import openpyxl as _openpyxl  # noqa: F401
+
+    OPENPYXL_IMPORT_ERROR = None
+except Exception as e:  # pragma: no cover - depends on local installation
+    OPENPYXL_IMPORT_ERROR = e
+
+try:
+    from scipy.signal import butter, filtfilt, iirnotch, lfilter, sosfilt, sosfiltfilt
+
+    SCIPY_IMPORT_ERROR = None
+except Exception as e:  # pragma: no cover - depends on local installation
+    butter = filtfilt = iirnotch = lfilter = sosfilt = sosfiltfilt = None
+    SCIPY_IMPORT_ERROR = e
 
 from PySide6.QtCore import QTimer, Signal, QObject, Slot
 from PySide6.QtGui import QColor, QPalette, QTextCursor
@@ -629,10 +665,71 @@ def make_spinbox(min_val, max_val, decimals, step, value, suffix="") -> QDoubleS
     return sb
 
 
+def safe_column_name(name: str, fallback: str) -> str:
+    clean = re.sub(r"[^0-9A-Za-z_]+", "_", str(name).strip()).strip("_")
+    return clean or fallback
+
+
+def unique_column_names(names: list[str]) -> list[str]:
+    seen: dict[str, int] = {}
+    unique = []
+    for name in names:
+        count = seen.get(name, 0)
+        seen[name] = count + 1
+        unique.append(name if count == 0 else f"{name}_{count + 1}")
+    return unique
+
+
+class LSLRecordingWorker(threading.Thread):
+    def __init__(self, inlet, sample_lock, samples, stim_getter, error_signal):
+        super().__init__(daemon=True)
+        self.inlet = inlet
+        self.sample_lock = sample_lock
+        self.samples = samples
+        self.stim_getter = stim_getter
+        self.error_signal = error_signal
+        self._stop_event = threading.Event()
+
+    def stop(self):
+        self._stop_event.set()
+
+    def run(self):
+        while not self._stop_event.is_set():
+            try:
+                chunk, timestamps = self.inlet.pull_chunk(timeout=0.05, max_samples=256)
+            except Exception as e:
+                self.error_signal.emit(str(e))
+                break
+
+            if not chunk:
+                continue
+
+            if len(timestamps) != len(chunk):
+                timestamps = [np.nan] * len(chunk)
+
+            rows = []
+            for sample, lsl_ts in zip(chunk, timestamps):
+                stim = self.stim_getter()
+                rows.append(
+                    {
+                        "lsl_timestamp": float(lsl_ts) if lsl_ts else np.nan,
+                        "app_timestamp": time.time(),
+                        "sample": [float(v) for v in sample],
+                        "stim_step_index": stim["step_index"],
+                        "stim_f1_hz": stim["f1_hz"],
+                        "stim_f2_hz": stim["f2_hz"],
+                    }
+                )
+
+            with self.sample_lock:
+                self.samples.extend(rows)
+
+
 # ── Main window ───────────────────────────────────────────────────────────────
 class MainWindow(QMainWindow):
     # Signal so serial thread can safely append text to the console
     _console_append = Signal(str, str)  # (text, css_color)
+    _lsl_worker_error = Signal(str)
 
     def __init__(self):
         super().__init__()
@@ -643,6 +740,7 @@ class MainWindow(QMainWindow):
         self.serial.connected.connect(self._on_connected)
         self.serial.message_received.connect(self._log_rx)
         self._console_append.connect(self._append_console)
+        self._lsl_worker_error.connect(self._on_lsl_worker_error)
         self._running = False
         self.sequence_steps: list[tuple[float, float, float]] = []
         self.sequence_file_path: str | None = None
@@ -650,6 +748,24 @@ class MainWindow(QMainWindow):
         self._sequence_timer = QTimer(self)
         self._sequence_timer.setSingleShot(True)
         self._sequence_timer.timeout.connect(self._run_next_sequence_step)
+
+        self.lsl_streams = []
+        self.lsl_inlet = None
+        self.lsl_stream_meta: dict = {}
+        self.lsl_channel_names: list[str] = []
+        self.lsl_worker: LSLRecordingWorker | None = None
+        self.lsl_samples: list[dict] = []
+        self.lsl_sample_lock = threading.Lock()
+        self._stim_lock = threading.Lock()
+        self._stim_events: list[dict] = []
+        self._current_stim = {
+            "step_index": -1,
+            "f1_hz": np.nan,
+            "f2_hz": np.nan,
+        }
+        self._recording_active = False
+        self._record_start_app_time: float | None = None
+        self._record_end_app_time: float | None = None
         self._build_ui()
 
         # Preview refresh timer (4 fps — purely local math)
@@ -696,6 +812,7 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_preview_tab(), "PREVIEW")
         self.tabs.addTab(self._build_debug_tab(), "DEBUG  CONSOLE")
+        self.tabs.addTab(self._build_lsl_tab(), "LSL  RECORDING")
 
         right.addWidget(self.tabs, 1)
         self._build_stats_panel(right)
@@ -804,6 +921,103 @@ class MainWindow(QMainWindow):
         cmd_row.addWidget(send_btn)
         v.addLayout(cmd_row)
 
+        return w
+
+    def _build_lsl_tab(self) -> QWidget:
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(4, 4, 4, 4)
+        v.setSpacing(8)
+
+        lsl_label = QLabel("LSL  STREAM")
+        lsl_label.setObjectName("section_label")
+        v.addWidget(lsl_label)
+
+        stream_box = QGroupBox("CONNECTION")
+        stream_grid = QGridLayout(stream_box)
+        stream_grid.setHorizontalSpacing(8)
+        stream_grid.setVerticalSpacing(6)
+
+        self.lsl_stream_combo = QComboBox()
+        self.lsl_stream_combo.setMinimumWidth(360)
+        self.lsl_stream_combo.currentIndexChanged.connect(self._update_lsl_stream_preview)
+        stream_grid.addWidget(self.lsl_stream_combo, 0, 0, 1, 3)
+
+        self.lsl_refresh_btn = QPushButton("REFRESH")
+        self.lsl_refresh_btn.clicked.connect(self._refresh_lsl_streams)
+        stream_grid.addWidget(self.lsl_refresh_btn, 1, 0)
+
+        self.lsl_connect_btn = QPushButton("CONNECT")
+        self.lsl_connect_btn.clicked.connect(self._connect_lsl_stream)
+        stream_grid.addWidget(self.lsl_connect_btn, 1, 1)
+
+        self.lsl_disconnect_btn = QPushButton("DISCONNECT")
+        self.lsl_disconnect_btn.clicked.connect(self._disconnect_lsl_stream)
+        self.lsl_disconnect_btn.setEnabled(False)
+        stream_grid.addWidget(self.lsl_disconnect_btn, 1, 2)
+
+        self.lsl_status_label = QLabel("Disconnected")
+        self.lsl_status_label.setStyleSheet(
+            f"color:{COLORS['text_dim']};font-size:11px;background-color:transparent;"
+        )
+        stream_grid.addWidget(self.lsl_status_label, 2, 0, 1, 3)
+
+        self.lsl_meta_text = QTextEdit()
+        self.lsl_meta_text.setReadOnly(True)
+        self.lsl_meta_text.setMaximumHeight(120)
+        stream_grid.addWidget(self.lsl_meta_text, 3, 0, 1, 3)
+        v.addWidget(stream_box)
+
+        filter_label = QLabel("RECORDING  FILTERS")
+        filter_label.setObjectName("section_label")
+        v.addWidget(filter_label)
+
+        filter_box = QGroupBox("FILTERS")
+        filter_grid = QGridLayout(filter_box)
+        filter_grid.setHorizontalSpacing(10)
+        filter_grid.setVerticalSpacing(6)
+
+        self.bandpass_enabled = QCheckBox("Bandpass")
+        self.bandpass_enabled.setChecked(True)
+        filter_grid.addWidget(self.bandpass_enabled, 0, 0)
+
+        self.bandpass_low = make_spinbox(0.01, 5000.0, 2, 0.5, 0.5, "Hz")
+        self.bandpass_high = make_spinbox(0.01, 5000.0, 2, 1.0, 40.0, "Hz")
+        self.bandpass_order = QSpinBox()
+        self.bandpass_order.setRange(1, 12)
+        self.bandpass_order.setValue(4)
+        filter_grid.addWidget(QLabel("Low"), 1, 0)
+        filter_grid.addWidget(self.bandpass_low, 1, 1)
+        filter_grid.addWidget(QLabel("High"), 2, 0)
+        filter_grid.addWidget(self.bandpass_high, 2, 1)
+        filter_grid.addWidget(QLabel("Order"), 3, 0)
+        filter_grid.addWidget(self.bandpass_order, 3, 1)
+
+        self.notch_enabled = QCheckBox("Notch")
+        self.notch_enabled.setChecked(True)
+        filter_grid.addWidget(self.notch_enabled, 0, 2)
+
+        self.notch_freq = make_spinbox(0.01, 5000.0, 2, 1.0, 50.0, "Hz")
+        self.notch_q = make_spinbox(0.1, 500.0, 1, 1.0, 30.0, "Q")
+        filter_grid.addWidget(QLabel("Freq"), 1, 2)
+        filter_grid.addWidget(self.notch_freq, 1, 3)
+        filter_grid.addWidget(QLabel("Q"), 2, 2)
+        filter_grid.addWidget(self.notch_q, 2, 3)
+
+        self.recording_status_label = QLabel("Recording: idle")
+        self.recording_status_label.setStyleSheet(
+            f"color:{COLORS['text_dim']};font-size:11px;background-color:transparent;"
+        )
+        filter_grid.addWidget(self.recording_status_label, 4, 0, 1, 4)
+
+        self.export_last_btn = QPushButton("EXPORT LAST")
+        self.export_last_btn.clicked.connect(self._export_lsl_recording)
+        self.export_last_btn.setEnabled(False)
+        filter_grid.addWidget(self.export_last_btn, 5, 0, 1, 4)
+        v.addWidget(filter_box)
+        v.addStretch()
+
+        self._refresh_lsl_streams()
         return w
 
     def _build_connection_box(self) -> QGroupBox:
@@ -989,6 +1203,171 @@ class MainWindow(QMainWindow):
         if not ports:
             self.port_combo.addItem("(no ports found)")
 
+    # ── LSL helpers ──────────────────────────────────────────────────────────
+    def _refresh_lsl_streams(self):
+        self.lsl_stream_combo.clear()
+        self.lsl_streams = []
+
+        if resolve_streams is None:
+            msg = f"pylsl unavailable: {LSL_IMPORT_ERROR}"
+            self.lsl_stream_combo.addItem("(pylsl unavailable)")
+            self.lsl_status_label.setText(msg)
+            self.lsl_connect_btn.setEnabled(False)
+            self.lsl_meta_text.setPlainText(msg)
+            return
+
+        try:
+            self.lsl_status_label.setText("Searching LSL streams...")
+            QApplication.processEvents()
+            self.lsl_streams = resolve_streams(wait_time=1.0)
+        except Exception as e:
+            self.lsl_status_label.setText(f"LSL refresh error: {e}")
+            self._log(f"LSL refresh error: {e}", COLORS["red"])
+            self.lsl_connect_btn.setEnabled(False)
+            return
+
+        if not self.lsl_streams:
+            self.lsl_stream_combo.addItem("(no LSL streams found)")
+            self.lsl_status_label.setText("No LSL streams found")
+            self.lsl_connect_btn.setEnabled(False)
+            self.lsl_meta_text.clear()
+            return
+
+        for info in self.lsl_streams:
+            meta = self._read_lsl_stream_meta(info)
+            self.lsl_stream_combo.addItem(
+                f"{meta['name']} | {meta['type']} | "
+                f"{meta['channel_count']} ch | {meta['nominal_srate_hz']} Hz"
+            )
+        self.lsl_status_label.setText(f"Found {len(self.lsl_streams)} LSL stream(s)")
+        self.lsl_connect_btn.setEnabled(self.lsl_inlet is None)
+        self._update_lsl_stream_preview()
+
+    def _update_lsl_stream_preview(self):
+        idx = self.lsl_stream_combo.currentIndex()
+        if idx < 0 or idx >= len(self.lsl_streams):
+            return
+        meta = self._read_lsl_stream_meta(self.lsl_streams[idx])
+        names = self._read_lsl_channel_names(self.lsl_streams[idx], meta["channel_count"])
+        self.lsl_meta_text.setPlainText(
+            "\n".join(
+                [
+                    f"name: {meta['name']}",
+                    f"type: {meta['type']}",
+                    f"source_id: {meta['source_id']}",
+                    f"uid: {meta['uid']}",
+                    f"channels: {meta['channel_count']}",
+                    f"nominal_srate_hz: {meta['nominal_srate_hz']}",
+                    f"channel_format: {meta['channel_format']}",
+                    f"channel_names: {', '.join(names)}",
+                ]
+            )
+        )
+
+    def _connect_lsl_stream(self):
+        if StreamInlet is None:
+            self._log(f"Cannot connect LSL: {LSL_IMPORT_ERROR}", COLORS["red"])
+            return
+        idx = self.lsl_stream_combo.currentIndex()
+        if idx < 0 or idx >= len(self.lsl_streams):
+            self._log("Select an LSL stream first.", COLORS["yellow"])
+            return
+
+        try:
+            info = self.lsl_streams[idx]
+            self.lsl_inlet = StreamInlet(info, max_buflen=60)
+            self.lsl_stream_meta = self._read_lsl_stream_meta(info)
+            self.lsl_channel_names = self._read_lsl_channel_names(
+                info, self.lsl_stream_meta["channel_count"]
+            )
+        except Exception as e:
+            self.lsl_inlet = None
+            self.lsl_stream_meta = {}
+            self.lsl_channel_names = []
+            self._log(f"LSL connect error: {e}", COLORS["red"])
+            self.lsl_status_label.setText(f"LSL connect error: {e}")
+            return
+
+        self.lsl_connect_btn.setEnabled(False)
+        self.lsl_disconnect_btn.setEnabled(True)
+        self.lsl_refresh_btn.setEnabled(False)
+        self.lsl_status_label.setText(
+            f"Connected: {self.lsl_stream_meta['name']} | "
+            f"{self.lsl_stream_meta['channel_count']} ch | "
+            f"{self.lsl_stream_meta['nominal_srate_hz']} Hz"
+        )
+        self._log(f"Connected LSL stream: {self.lsl_stream_meta['name']}", COLORS["green"])
+
+    def _disconnect_lsl_stream(self):
+        if self._recording_active or self._running:
+            self._log("LSL disconnected during experiment.", COLORS["red"])
+            self._stop(reason="LSL disconnected")
+
+        if self.lsl_inlet is not None:
+            try:
+                self.lsl_inlet.close_stream()
+            except Exception:
+                pass
+        self.lsl_inlet = None
+        self.lsl_stream_meta = {}
+        self.lsl_channel_names = []
+        self.lsl_connect_btn.setEnabled(bool(self.lsl_streams))
+        self.lsl_disconnect_btn.setEnabled(False)
+        self.lsl_refresh_btn.setEnabled(True)
+        self.lsl_status_label.setText("Disconnected")
+        self._log("LSL stream disconnected.", COLORS["text_dim"])
+
+    def _read_lsl_stream_meta(self, info) -> dict:
+        def read(method_name: str, default):
+            try:
+                return getattr(info, method_name)()
+            except Exception:
+                return default
+
+        protocol_version = ""
+        library_version = ""
+        if pylsl is not None:
+            for attr, target in (
+                ("protocol_version", "protocol_version"),
+                ("library_version", "library_version"),
+            ):
+                try:
+                    value = getattr(pylsl, attr)()
+                except Exception:
+                    value = ""
+                if target == "protocol_version":
+                    protocol_version = value
+                else:
+                    library_version = value
+
+        return {
+            "name": read("name", ""),
+            "type": read("type", ""),
+            "source_id": read("source_id", ""),
+            "uid": read("uid", ""),
+            "channel_count": int(read("channel_count", 0) or 0),
+            "nominal_srate_hz": float(read("nominal_srate", 0.0) or 0.0),
+            "channel_format": read("channel_format", ""),
+            "lsl_protocol_version": protocol_version,
+            "lsl_library_version": library_version,
+        }
+
+    def _read_lsl_channel_names(self, info, channel_count: int) -> list[str]:
+        names = []
+        try:
+            ch = info.desc().child("channels").child("channel")
+            while ch is not None and not ch.empty():
+                label = ch.child_value("label") or ch.child_value("name")
+                if label:
+                    names.append(label)
+                ch = ch.next_sibling()
+        except Exception:
+            names = []
+
+        while len(names) < channel_count:
+            names.append(f"ch_{len(names) + 1}")
+        return names[:channel_count]
+
     def _get_params(self) -> dict:
         return {
             "a1": self.amp1.value(),
@@ -1098,6 +1477,327 @@ class MainWindow(QMainWindow):
     def _set_frequency_controls_enabled(self, enabled: bool):
         for widget in (self.freq1, self.freq2):
             widget.setEnabled(enabled)
+
+    def _get_filter_config(self) -> dict:
+        return {
+            "bandpass_enabled": self.bandpass_enabled.isChecked(),
+            "bandpass_low_hz": self.bandpass_low.value(),
+            "bandpass_high_hz": self.bandpass_high.value(),
+            "bandpass_order": self.bandpass_order.value(),
+            "notch_enabled": self.notch_enabled.isChecked(),
+            "notch_hz": self.notch_freq.value(),
+            "notch_q": self.notch_q.value(),
+        }
+
+    def _validate_lsl_recording_ready(self) -> bool:
+        if self.lsl_inlet is None:
+            self.status_bar.showMessage("Connect an LSL stream before START")
+            self._log("Connect an LSL stream before START.", COLORS["red"])
+            return False
+
+        missing = []
+        for name, err in (
+            ("pandas", PANDAS_IMPORT_ERROR),
+            ("openpyxl", OPENPYXL_IMPORT_ERROR),
+            ("scipy", SCIPY_IMPORT_ERROR),
+        ):
+            if err is not None:
+                missing.append(f"{name}: {err}")
+        if missing:
+            self.status_bar.showMessage("Missing export/filter dependencies")
+            self._log("Missing dependencies: " + " | ".join(missing), COLORS["red"])
+            return False
+
+        cfg = self._get_filter_config()
+        fs = float(self.lsl_stream_meta.get("nominal_srate_hz", 0.0) or 0.0)
+        if fs <= 0:
+            self._log("LSL stream must provide a positive nominal sampling rate.", COLORS["red"])
+            self.status_bar.showMessage("Invalid LSL sampling rate")
+            return False
+
+        nyquist = fs / 2.0
+        if cfg["bandpass_enabled"]:
+            if cfg["bandpass_low_hz"] <= 0:
+                self._log("Bandpass low frequency must be greater than 0.", COLORS["red"])
+                return False
+            if cfg["bandpass_low_hz"] >= cfg["bandpass_high_hz"]:
+                self._log("Bandpass low frequency must be below high frequency.", COLORS["red"])
+                return False
+            if cfg["bandpass_high_hz"] >= nyquist:
+                self._log(
+                    f"Bandpass high frequency must be below Nyquist ({nyquist:.3f} Hz).",
+                    COLORS["red"],
+                )
+                return False
+
+        if cfg["notch_enabled"]:
+            if cfg["notch_hz"] <= 0:
+                self._log("Notch frequency must be greater than 0.", COLORS["red"])
+                return False
+            if cfg["notch_hz"] >= nyquist:
+                self._log(
+                    f"Notch frequency must be below Nyquist ({nyquist:.3f} Hz).",
+                    COLORS["red"],
+                )
+                return False
+            if cfg["notch_q"] <= 0:
+                self._log("Notch Q must be greater than 0.", COLORS["red"])
+                return False
+        return True
+
+    def _set_current_stim(self, step_index: int, f1: float, f2: float):
+        event = {
+            "step_index": int(step_index),
+            "f1_hz": float(f1),
+            "f2_hz": float(f2),
+            "app_timestamp": time.time(),
+            "lsl_timestamp": float(local_clock()) if local_clock else np.nan,
+        }
+        with self._stim_lock:
+            self._current_stim = {
+                "step_index": event["step_index"],
+                "f1_hz": event["f1_hz"],
+                "f2_hz": event["f2_hz"],
+            }
+            self._stim_events.append(event)
+
+    def _get_current_stim(self) -> dict:
+        with self._stim_lock:
+            return dict(self._current_stim)
+
+    def _begin_lsl_recording(self, step_index: int, f1: float, f2: float) -> bool:
+        if self.lsl_inlet is None:
+            self._log("Cannot start recording: LSL stream is not connected.", COLORS["red"])
+            return False
+
+        if self.lsl_worker and self.lsl_worker.is_alive():
+            self.lsl_worker.stop()
+            self.lsl_worker.join(timeout=1.0)
+
+        if self.lsl_samples:
+            self._log("Previous recorded LSL data discarded for a new experiment.", COLORS["yellow"])
+
+        with self.lsl_sample_lock:
+            self.lsl_samples.clear()
+        self.export_last_btn.setEnabled(False)
+        with self._stim_lock:
+            self._stim_events = []
+
+        self._record_start_app_time = time.time()
+        self._record_end_app_time = None
+        self._set_current_stim(step_index, f1, f2)
+
+        try:
+            self.lsl_inlet.flush()
+        except Exception:
+            pass
+
+        self.lsl_worker = LSLRecordingWorker(
+            inlet=self.lsl_inlet,
+            sample_lock=self.lsl_sample_lock,
+            samples=self.lsl_samples,
+            stim_getter=self._get_current_stim,
+            error_signal=self._lsl_worker_error,
+        )
+        self._recording_active = True
+        self.recording_status_label.setText("Recording: active")
+        self.lsl_worker.start()
+        self._log("LSL recording started.", COLORS["green"])
+        return True
+
+    def _stop_lsl_recording(self, export: bool = True):
+        worker = self.lsl_worker
+        if worker is not None:
+            worker.stop()
+            worker.join(timeout=1.5)
+            self.lsl_worker = None
+
+        if self._recording_active:
+            self._record_end_app_time = time.time()
+        self._recording_active = False
+
+        with self.lsl_sample_lock:
+            count = len(self.lsl_samples)
+        self.recording_status_label.setText(f"Recording: stopped | {count} samples")
+        self.export_last_btn.setEnabled(bool(count))
+        if count:
+            self._log(f"LSL recording stopped: {count} samples.", COLORS["green"])
+        else:
+            self._log("LSL recording stopped: no samples captured.", COLORS["yellow"])
+
+        if export and count:
+            self._export_lsl_recording()
+
+    @Slot(str)
+    def _on_lsl_worker_error(self, msg: str):
+        self._log(f"LSL recording error: {msg}", COLORS["red"])
+        self.status_bar.showMessage(f"LSL recording error: {msg}")
+        if self._running:
+            self._stop(reason="LSL recording error")
+
+    def _export_lsl_recording(self):
+        with self.lsl_sample_lock:
+            records = list(self.lsl_samples)
+        if not records:
+            self._log("No LSL data to export.", COLORS["yellow"])
+            return
+
+        default_name = f"experiment_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save experiment export",
+            str(Path.cwd() / default_name),
+            "Excel workbook (*.xlsx)",
+        )
+        if not path:
+            self._log("Export canceled. Recorded data remains in memory until next START.", COLORS["yellow"])
+            self.status_bar.showMessage("Export canceled")
+            return
+        if not path.lower().endswith(".xlsx"):
+            path += ".xlsx"
+
+        try:
+            data_df, metadata_df = self._build_export_frames(records)
+            self._write_xlsx_export(path, data_df, metadata_df)
+        except Exception as e:
+            self._log(f"Export failed: {e}", COLORS["red"])
+            self.status_bar.showMessage(f"Export failed: {e}")
+            return
+
+        self._log(f"Export saved: {path}", COLORS["green"])
+        self.status_bar.showMessage(f"Export saved: {path}")
+
+    def _build_export_frames(self, records: list[dict]):
+        cfg = self._get_filter_config()
+        stream_meta = dict(self.lsl_stream_meta)
+        nominal_fs = float(stream_meta.get("nominal_srate_hz", 0.0) or 0.0)
+        max_sample_len = max((len(r["sample"]) for r in records), default=0)
+        channel_count = max(int(stream_meta.get("channel_count", 0) or 0), max_sample_len)
+        channel_names = list(self.lsl_channel_names)
+        while len(channel_names) < channel_count:
+            channel_names.append(f"ch_{len(channel_names) + 1}")
+        channel_names = channel_names[:channel_count]
+        safe_names = unique_column_names(
+            [safe_column_name(name, f"ch_{i + 1}") for i, name in enumerate(channel_names)]
+        )
+
+        raw = np.full((len(records), channel_count), np.nan, dtype=np.float64)
+        for row_idx, rec in enumerate(records):
+            sample = rec["sample"]
+            n = min(len(sample), channel_count)
+            if n:
+                raw[row_idx, :n] = sample[:n]
+
+        filtered, filter_notes = self._apply_recording_filters(raw, nominal_fs, cfg)
+        effective_fs = self._compute_effective_srate(records, nominal_fs)
+        start_app = self._record_start_app_time or records[0]["app_timestamp"]
+
+        data = {
+            "record_elapsed_s": [r["app_timestamp"] - start_app for r in records],
+            "lsl_timestamp": [r["lsl_timestamp"] for r in records],
+            "app_timestamp": [r["app_timestamp"] for r in records],
+            "stim_step_index": [r["stim_step_index"] for r in records],
+            "stim_f1_hz": [r["stim_f1_hz"] for r in records],
+            "stim_f2_hz": [r["stim_f2_hz"] for r in records],
+            "lsl_stream_name": stream_meta.get("name", ""),
+            "lsl_stream_type": stream_meta.get("type", ""),
+            "lsl_source_id": stream_meta.get("source_id", ""),
+            "lsl_nominal_srate_hz": nominal_fs,
+            "lsl_effective_srate_hz": effective_fs,
+            "bandpass_enabled": cfg["bandpass_enabled"],
+            "bandpass_low_hz": cfg["bandpass_low_hz"],
+            "bandpass_high_hz": cfg["bandpass_high_hz"],
+            "bandpass_order": cfg["bandpass_order"],
+            "notch_enabled": cfg["notch_enabled"],
+            "notch_hz": cfg["notch_hz"],
+            "notch_q": cfg["notch_q"],
+        }
+        for idx, name in enumerate(safe_names):
+            data[f"raw_{name}"] = raw[:, idx]
+            data[f"filtered_{name}"] = filtered[:, idx]
+        data_df = pd.DataFrame(data)
+
+        p = self._get_params()
+        metadata = {
+            "export_created_at": datetime.now().isoformat(timespec="seconds"),
+            "record_start_app_timestamp": self._record_start_app_time,
+            "record_end_app_timestamp": self._record_end_app_time,
+            "record_samples": len(records),
+            "record_duration_s": (
+                (self._record_end_app_time or records[-1]["app_timestamp"]) - start_app
+            ),
+            "stim_sequence_file": self.sequence_file_path or "",
+            "stim_events_json": self._json_value(self._stim_events),
+            "lsl_stream_meta_json": self._json_value(stream_meta),
+            "lsl_channel_names_json": self._json_value(channel_names),
+            "filter_config_json": self._json_value(cfg),
+            "filter_notes_json": self._json_value(filter_notes),
+            "arduino_params_json": self._json_value(p),
+            "serial_port": self.port_combo.currentText(),
+            "serial_baud": 115200,
+        }
+        metadata_df = pd.DataFrame(
+            [{"key": key, "value": value} for key, value in metadata.items()]
+        )
+        return data_df, metadata_df
+
+    def _json_value(self, value) -> str:
+        return json.dumps(value, ensure_ascii=False, default=str)
+
+    def _apply_recording_filters(self, raw: np.ndarray, fs: float, cfg: dict):
+        notes = []
+        filtered = np.nan_to_num(raw.astype(np.float64, copy=True), nan=0.0, posinf=0.0, neginf=0.0)
+        if np.isnan(raw).any():
+            notes.append("missing raw samples were filled with 0 for filtering")
+
+        if cfg["bandpass_enabled"]:
+            sos = butter(
+                int(cfg["bandpass_order"]),
+                [cfg["bandpass_low_hz"], cfg["bandpass_high_hz"]],
+                btype="bandpass",
+                fs=fs,
+                output="sos",
+            )
+            try:
+                filtered = sosfiltfilt(sos, filtered, axis=0)
+                notes.append("bandpass applied with sosfiltfilt")
+            except ValueError as e:
+                filtered = sosfilt(sos, filtered, axis=0)
+                notes.append(f"bandpass fallback to causal sosfilt: {e}")
+
+        if cfg["notch_enabled"]:
+            b, a = iirnotch(cfg["notch_hz"], cfg["notch_q"], fs=fs)
+            try:
+                filtered = filtfilt(b, a, filtered, axis=0)
+                notes.append("notch applied with filtfilt")
+            except ValueError as e:
+                filtered = lfilter(b, a, filtered, axis=0)
+                notes.append(f"notch fallback to causal lfilter: {e}")
+
+        if not cfg["bandpass_enabled"] and not cfg["notch_enabled"]:
+            notes.append("filters disabled; filtered columns equal raw columns with missing values filled")
+        return filtered, notes
+
+    def _compute_effective_srate(self, records: list[dict], nominal_fs: float) -> float:
+        stamps = [
+            r["lsl_timestamp"]
+            for r in records
+            if isinstance(r.get("lsl_timestamp"), float) and np.isfinite(r["lsl_timestamp"])
+        ]
+        if len(stamps) >= 2 and stamps[-1] > stamps[0]:
+            return (len(stamps) - 1) / (stamps[-1] - stamps[0])
+        return nominal_fs
+
+    def _write_xlsx_export(self, path: str, data_df, metadata_df):
+        rows_per_sheet = 1_048_000
+        with pd.ExcelWriter(path, engine="openpyxl") as writer:
+            if len(data_df) <= rows_per_sheet:
+                data_df.to_excel(writer, sheet_name="data", index=False)
+            else:
+                for sheet_idx, start in enumerate(range(0, len(data_df), rows_per_sheet), 1):
+                    chunk = data_df.iloc[start : start + rows_per_sheet]
+                    chunk.to_excel(writer, sheet_name=f"data_{sheet_idx}", index=False)
+            metadata_df.to_excel(writer, sheet_name="metadata", index=False)
 
     def _check_clipping(self, p: dict) -> str:
         g = p["gain_max"]
@@ -1339,12 +2039,19 @@ class MainWindow(QMainWindow):
             self._start_sequence()
             return
 
+        if not self._validate_lsl_recording_ready():
+            return
+
         if not self._apply_params():
             return
         time.sleep(0.05)  # let Due finish ACKing all SET commands
         self._log("→ START", COLORS["green"])
         resp = self._send("START")
         if resp and "OK" in resp:
+            p = self._get_params()
+            if not self._begin_lsl_recording(step_index=0, f1=p["f1"], f2=p["f2"]):
+                self._send("STOP")
+                return
             self._running = True
             self.start_btn.setEnabled(False)
             self.stop_btn.setEnabled(True)
@@ -1356,6 +2063,8 @@ class MainWindow(QMainWindow):
 
     def _start_sequence(self):
         if not self.serial.is_open or not self.sequence_steps:
+            return
+        if not self._validate_lsl_recording_ready():
             return
 
         self._sequence_index = 0
@@ -1408,12 +2117,16 @@ class MainWindow(QMainWindow):
             if not resp or "OK" not in resp:
                 self._abort_sequence("START was not acknowledged")
                 return
+            if not self._begin_lsl_recording(step_index=step_no, f1=f1, f2=f2):
+                self._abort_sequence("LSL recording did not start")
+                return
             if self.dbg_checkbox.isChecked():
                 self._send("DBG ON")
         else:
             for cmd in (f"SET F1 {f1:.4f}", f"SET F2 {f2:.4f}"):
                 self._log(f"  → {cmd}", COLORS["accent2"])
                 self._send(cmd)
+            self._set_current_stim(step_no, f1, f2)
 
         self._sequence_index += 1
         self._sequence_timer.start(max(1, int(seconds * 1000)))
@@ -1429,6 +2142,8 @@ class MainWindow(QMainWindow):
         if self.serial.is_open:
             self._log("→ STOP", COLORS["red"])
             self._send("STOP")
+        if self._recording_active:
+            self._stop_lsl_recording(export=True)
         self._running = False
         self._sequence_index = 0
         self.start_btn.setEnabled(self.serial.is_open)
@@ -1437,19 +2152,21 @@ class MainWindow(QMainWindow):
         self.sequence_clear_btn.setEnabled(bool(self.sequence_steps))
         self.status_bar.showMessage(f"Sequence aborted: {reason}")
 
-    def _stop(self):
+    def _stop(self, checked=False, export: bool = True, reason: str = "Stopped"):
         self._sequence_timer.stop()
         self._log("→ STOP", COLORS["red"])
         if self.serial.is_open:
             self._send("STOP")
+        if self._recording_active or self.lsl_worker is not None:
+            self._stop_lsl_recording(export=export)
         self._running = False
         self._sequence_index = 0
         self.start_btn.setEnabled(self.serial.is_open)
         self.stop_btn.setEnabled(False)
         self.sequence_load_btn.setEnabled(True)
         self.sequence_clear_btn.setEnabled(bool(self.sequence_steps))
-        self.status_bar.showMessage("■ Stopped")
-        self._log("■ Stopped", COLORS["red"])
+        self.status_bar.showMessage(f"■ {reason}")
+        self._log(f"■ {reason}", COLORS["red"])
         if self.dbg_checkbox.isChecked() and self.serial.is_open:
             self._send("DBG OFF")
 
@@ -1462,6 +2179,8 @@ class MainWindow(QMainWindow):
             self.start_btn.setEnabled(True)
             self.stop_btn.setEnabled(False)
         else:
+            if self._running or self._recording_active:
+                self._stop(reason="Serial disconnected")
             self._sequence_timer.stop()
             self.connect_btn.setText("CONNECT")
             self.apply_btn.setEnabled(False)
@@ -1479,7 +2198,12 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         if self.serial.is_open:
             self._send("DBG OFF")
-        self._stop()
+        self._stop(export=False)
+        if self.lsl_inlet is not None:
+            try:
+                self.lsl_inlet.close_stream()
+            except Exception:
+                pass
         self.serial.close()
         super().closeEvent(event)
 

@@ -503,6 +503,7 @@ class MainWindow(QMainWindow):
         self.lsl_worker: LSLRecordingWorker | None = None
         self.lsl_samples: list[dict] = []
         self.lsl_sample_lock = threading.Lock()
+        self._record_sequence_steps: list[SequenceStep] = []
         self._stim_lock = threading.Lock()
         self._stim_events: list[dict] = []
         self._current_stim = {
@@ -1571,6 +1572,7 @@ class MainWindow(QMainWindow):
         with self._stim_lock:
             self._stim_events = []
 
+        self._record_sequence_steps = list(self.sequence_steps)
         self._record_start_app_time = time.time()
         self._record_end_app_time = None
         self._set_current_stim(step_index, f1, f2)
@@ -1631,9 +1633,14 @@ class MainWindow(QMainWindow):
             return
 
         default_name = f"experiment_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        dialog_title = (
+            "Сохранить базовое имя экспортов по этапам"
+            if self._record_sequence_steps
+            else "Сохранить экспорт эксперимента"
+        )
         path, _ = QFileDialog.getSaveFileName(
             self,
-            "Сохранить экспорт эксперимента",
+            dialog_title,
             str(Path.cwd() / default_name),
             "Текстовый файл (*.txt)",
         )
@@ -1645,17 +1652,62 @@ class MainWindow(QMainWindow):
             path += ".txt"
 
         try:
-            data_df, metadata_df = self._build_export_frames(records)
-            self._write_txt_export(path, data_df, metadata_df)
+            if self._record_sequence_steps:
+                saved_paths = self._export_sequence_step_logs(path, records)
+            else:
+                data_df, metadata_df = self._build_export_frames(records)
+                self._write_txt_export(path, data_df, metadata_df)
+                saved_paths = [path]
         except Exception as e:
             self._log(f"Ошибка экспорта: {e}", COLORS["red"])
             self.status_bar.showMessage(f"Ошибка экспорта: {e}")
             return
 
-        self._log(f"Экспорт сохранен: {path}", COLORS["green"])
-        self.status_bar.showMessage(f"Экспорт сохранен: {path}")
+        if len(saved_paths) == 1:
+            self._log(f"Экспорт сохранен: {saved_paths[0]}", COLORS["green"])
+            self.status_bar.showMessage(f"Экспорт сохранен: {saved_paths[0]}")
+        else:
+            self._log(f"Экспорт сохранен по этапам: {len(saved_paths)} файлов.", COLORS["green"])
+            for saved_path in saved_paths:
+                self._log(f"  {saved_path}", COLORS["text_dim"])
+            self.status_bar.showMessage(f"Экспорт сохранен: {len(saved_paths)} файлов")
 
-    def _build_export_frames(self, records: list[dict]):
+    def _export_sequence_step_logs(self, base_path: str, records: list[dict]) -> list[str]:
+        saved_paths = []
+        total_steps = len(self._record_sequence_steps)
+        records_by_step: dict[int, list[dict]] = {idx: [] for idx in range(1, total_steps + 1)}
+        for rec in records:
+            try:
+                step_idx = int(rec.get("stim_step_index", -1))
+            except (TypeError, ValueError):
+                step_idx = -1
+            if step_idx in records_by_step:
+                records_by_step[step_idx].append(rec)
+
+        for step_no, step in enumerate(self._record_sequence_steps, 1):
+            step_records = records_by_step.get(step_no, [])
+            metadata_extra = {
+                "export_split_by_step": True,
+                "export_step_index": step_no,
+                "export_step_total": total_steps,
+                "export_step_f1_hz": step.f1,
+                "export_step_f2_hz": np.nan if step.f2 is None else step.f2,
+                "export_step_duration_s": step.seconds,
+                "export_step_records": len(step_records),
+            }
+            data_df, metadata_df = self._build_export_frames(step_records, metadata_extra)
+            step_path = self._step_export_path(base_path, step_no, total_steps)
+            self._write_txt_export(step_path, data_df, metadata_df)
+            saved_paths.append(step_path)
+        return saved_paths
+
+    def _step_export_path(self, base_path: str, step_no: int, total_steps: int) -> str:
+        path = Path(base_path)
+        suffix = path.suffix or ".txt"
+        digits = max(2, len(str(total_steps)))
+        return str(path.with_name(f"{path.stem}_step_{step_no:0{digits}d}{suffix}"))
+
+    def _build_export_frames(self, records: list[dict], metadata_extra: dict | None = None):
         cfg = self._get_filter_config()
         stream_meta = dict(self.lsl_stream_meta)
         nominal_fs = float(stream_meta.get("nominal_srate_hz", 0.0) or 0.0)
@@ -1678,7 +1730,13 @@ class MainWindow(QMainWindow):
 
         filtered, filter_notes = self._apply_recording_filters(raw, nominal_fs, cfg)
         effective_fs = self._compute_effective_srate(records, nominal_fs)
-        start_app = self._record_start_app_time or records[0]["app_timestamp"]
+        start_app = self._record_start_app_time
+        if start_app is None:
+            start_app = records[0]["app_timestamp"] if records else np.nan
+        row_count = len(records)
+
+        def repeat(value):
+            return [value] * row_count
 
         data = {
             "record_elapsed_s": [r["app_timestamp"] - start_app for r in records],
@@ -1687,18 +1745,18 @@ class MainWindow(QMainWindow):
             "stim_step_index": [r["stim_step_index"] for r in records],
             "stim_f1_hz": [r["stim_f1_hz"] for r in records],
             "stim_f2_hz": [r["stim_f2_hz"] for r in records],
-            "lsl_stream_name": stream_meta.get("name", ""),
-            "lsl_stream_type": stream_meta.get("type", ""),
-            "lsl_source_id": stream_meta.get("source_id", ""),
-            "lsl_nominal_srate_hz": nominal_fs,
-            "lsl_effective_srate_hz": effective_fs,
-            "bandpass_enabled": cfg["bandpass_enabled"],
-            "bandpass_low_hz": cfg["bandpass_low_hz"],
-            "bandpass_high_hz": cfg["bandpass_high_hz"],
-            "bandpass_order": cfg["bandpass_order"],
-            "notch_enabled": cfg["notch_enabled"],
-            "notch_hz": cfg["notch_hz"],
-            "notch_q": cfg["notch_q"],
+            "lsl_stream_name": repeat(stream_meta.get("name", "")),
+            "lsl_stream_type": repeat(stream_meta.get("type", "")),
+            "lsl_source_id": repeat(stream_meta.get("source_id", "")),
+            "lsl_nominal_srate_hz": repeat(nominal_fs),
+            "lsl_effective_srate_hz": repeat(effective_fs),
+            "bandpass_enabled": repeat(cfg["bandpass_enabled"]),
+            "bandpass_low_hz": repeat(cfg["bandpass_low_hz"]),
+            "bandpass_high_hz": repeat(cfg["bandpass_high_hz"]),
+            "bandpass_order": repeat(cfg["bandpass_order"]),
+            "notch_enabled": repeat(cfg["notch_enabled"]),
+            "notch_hz": repeat(cfg["notch_hz"]),
+            "notch_q": repeat(cfg["notch_q"]),
         }
         for idx, name in enumerate(safe_names):
             data[f"raw_{name}"] = raw[:, idx]
@@ -1712,9 +1770,14 @@ class MainWindow(QMainWindow):
             "record_end_app_timestamp": self._record_end_app_time,
             "record_samples": len(records),
             "record_duration_s": (
-                (self._record_end_app_time or records[-1]["app_timestamp"]) - start_app
+                ((self._record_end_app_time or records[-1]["app_timestamp"]) - start_app)
+                if records and np.isfinite(start_app)
+                else 0.0
             ),
             "stim_sequence_file": self.sequence_file_path or "",
+            "record_sequence_steps_json": self._json_value(
+                self._sequence_steps_to_metadata(self._record_sequence_steps)
+            ),
             "stim_events_json": self._json_value(self._stim_events),
             "lsl_stream_meta_json": self._json_value(stream_meta),
             "lsl_channel_names_json": self._json_value(channel_names),
@@ -1724,10 +1787,23 @@ class MainWindow(QMainWindow):
             "serial_port": self.port_combo.currentText(),
             "serial_baud": 115200,
         }
+        if metadata_extra:
+            metadata.update(metadata_extra)
         metadata_df = pd.DataFrame(
             [{"key": key, "value": value} for key, value in metadata.items()]
         )
         return data_df, metadata_df
+
+    def _sequence_steps_to_metadata(self, steps: list[SequenceStep]) -> list[dict]:
+        return [
+            {
+                "step_index": idx,
+                "f1_hz": step.f1,
+                "f2_hz": np.nan if step.f2 is None else step.f2,
+                "duration_s": step.seconds,
+            }
+            for idx, step in enumerate(steps, 1)
+        ]
 
     def _json_value(self, value) -> str:
         return json.dumps(value, ensure_ascii=False, default=str)
@@ -1735,6 +1811,9 @@ class MainWindow(QMainWindow):
     def _apply_recording_filters(self, raw: np.ndarray, fs: float, cfg: dict):
         notes = []
         filtered = np.nan_to_num(raw.astype(np.float64, copy=True), nan=0.0, posinf=0.0, neginf=0.0)
+        if raw.shape[0] == 0:
+            notes.append("no samples for this export segment; filtered columns are empty")
+            return filtered, notes
         if np.isnan(raw).any():
             notes.append("missing raw samples were filled with 0 for filtering")
 

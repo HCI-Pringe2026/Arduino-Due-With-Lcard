@@ -1,6 +1,6 @@
 /**
  * dual_sine_dac.ino
- * Arduino Due — DAC1 dual-sine wave generator  (v3.0 — envelope, fixed ISR)
+ * Arduino Due — DAC0 dual-sine wave generator  (v3.0 — envelope, fixed ISR)
  *
  * Formula (envelope-corrected sum):
  *   A(t)  = clamp( |1 / sin(π(f2-f1)t + π/2)| , 0, GAIN_MAX )
@@ -23,7 +23,7 @@
  *   DBG ON|OFF       — Enable/disable periodic debug telemetry (~10 Hz)
  *
  * Changes from v2.0:
- *   • analogWrite(DAC1, …) replaced with direct DACC register write
+ *   • analogWrite(DAC0, …) replaced with direct DACC register write
  *     → ISR execution time drops ~10×, loop() is no longer starved
  *   • Phase accumulator replaces per-tick t*ω multiply
  *     → removes one float multiply + implicit integer→float cast per tick
@@ -188,8 +188,8 @@ void setupDACC() {
                    | DACC_MR_REFRESH(1)
                    | DACC_MR_STARTUP_8
                    | DACC_MR_MAXS;
-    dacc_set_channel_selection(DACC, 1);   // DAC1
-    dacc_enable_channel(DACC, 1);
+    dacc_set_channel_selection(DACC, 0);   // DAC0
+    dacc_enable_channel(DACC, 0);
 }
 
 // ── Clamp helpers ────────────────────────────────────────────────────────────

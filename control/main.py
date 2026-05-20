@@ -50,7 +50,7 @@ except Exception as e:  # pragma: no cover - depends on local installation
     butter = filtfilt = iirnotch = lfilter = sosfilt = sosfiltfilt = None
     SCIPY_IMPORT_ERROR = e
 
-from PySide6.QtCore import QTimer, Signal, QObject, Slot, Qt
+from PySide6.QtCore import QSettings, QTimer, Signal, QObject, Slot, Qt
 from PySide6.QtGui import QColor, QPalette, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
@@ -277,6 +277,19 @@ QCheckBox::indicator:checked {{
     background: {COLORS['accent']};
     border-color: {COLORS['accent']};
 }}
+QCheckBox#serial_status, QCheckBox#lsl_status {{
+    spacing: 0px;
+}}
+QCheckBox#serial_status::indicator, QCheckBox#lsl_status::indicator {{
+    width: 14px; height: 14px;
+    border: 1px solid {COLORS['red']};
+    border-radius: 3px;
+    background: {COLORS['red']};
+}}
+QCheckBox#serial_status::indicator:checked, QCheckBox#lsl_status::indicator:checked {{
+    background: {COLORS['green']};
+    border-color: {COLORS['green']};
+}}
 QTableWidget {{
     background-color: {COLORS['surface']};
     border: 1px solid {COLORS['border']};
@@ -477,6 +490,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Контроллер двух синусов  //  Arduino Due  v3.0")
         self.resize(1100, 760)
+        self.settings = QSettings("JUT SWO", "DualSineController")
         self.serial = SerialWorker()
         self.serial.error_occurred.connect(self._on_serial_error)
         self.serial.connected.connect(self._on_connected)
@@ -536,6 +550,7 @@ class MainWindow(QMainWindow):
         # Clip counters for stats panel
         self._total_clip_hi = [0, 0]
         self._total_clip_lo = [0, 0]
+        QTimer.singleShot(0, self._attempt_initial_connections)
 
     # ── UI construction ───────────────────────────────────────────────────────
     def _build_ui(self):
@@ -574,9 +589,9 @@ class MainWindow(QMainWindow):
         right = QVBoxLayout()
         right.setSpacing(8)
 
+        self._init_debug_support_widgets()
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_preview_tab(), "ПРЕДПРОСМОТР")
-        self.tabs.addTab(self._build_debug_tab(), "ОТЛАДКА")
         self.tabs.addTab(self._build_lsl_tab(), "LSL  ЗАПИСЬ")
 
         right.addWidget(self.tabs, 1)
@@ -591,6 +606,39 @@ class MainWindow(QMainWindow):
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("Отключено")
+
+    def _init_debug_support_widgets(self):
+        def make_dbg_label(attr: str):
+            label = QLabel("—")
+            label.setStyleSheet(
+                f"color:{COLORS['text']};font-family:'JetBrains Mono';font-size:11px;"
+            )
+            setattr(self, attr, label)
+
+        for attr in (
+            "dstat_isr",
+            "dstat_cliphi0",
+            "dstat_cliplo0",
+            "dstat_env0",
+            "dstat_cliphi1",
+            "dstat_cliplo1",
+            "dstat_env1",
+            "dstat_samps",
+        ):
+            make_dbg_label(attr)
+
+        self.dbg_checkbox = QCheckBox()
+        self.dbg_checkbox.setChecked(False)
+        self.dbg_checkbox.toggled.connect(self._toggle_dbg)
+
+        self.autoscroll_cb = QCheckBox()
+        self.autoscroll_cb.setChecked(True)
+
+        self.console = QTextEdit()
+        self.console.setReadOnly(True)
+
+        self.cmd_input = QLineEdit()
+        self.cmd_input.returnPressed.connect(self._send_manual_cmd)
 
     def _build_preview_tab(self) -> QWidget:
         w = QWidget()
@@ -637,90 +685,6 @@ class MainWindow(QMainWindow):
         v.addWidget(self.total_time_bar)
         return w
 
-    def _build_debug_tab(self) -> QWidget:
-        w = QWidget()
-        v = QVBoxLayout(w)
-        v.setContentsMargins(4, 4, 4, 4)
-        v.setSpacing(6)
-
-        telem_label = QLabel("ПОКАЗАТЕЛИ  С  ПЛАТЫ  (~10 Гц)")
-        telem_label.setObjectName("section_label")
-        v.addWidget(telem_label)
-
-        # ── Debug stats bar ───────────────────────────────────────────────────
-        stats_frame = QFrame()
-        stats_frame.setStyleSheet(
-            f"QFrame {{ background:{COLORS['surface']}; border:1px solid {COLORS['border']};"
-            f"border-radius:4px; }}"
-        )
-        sg = QGridLayout(stats_frame)
-        sg.setContentsMargins(10, 6, 10, 6)
-        sg.setHorizontalSpacing(20)
-
-        def dstat(label, attr, col):
-            lb = QLabel(label)
-            lb.setStyleSheet(
-                f"color:{COLORS['text_dim']};font-size:10px;letter-spacing:1px;"
-            )
-            vl = QLabel("—")
-            vl.setStyleSheet(
-                f"color:{COLORS['text']};font-family:'JetBrains Mono';font-size:11px;"
-            )
-            setattr(self, attr, vl)
-            sg.addWidget(lb, 0, col)
-            sg.addWidget(vl, 1, col)
-
-        dstat("ISR, мкс", "dstat_isr", 0)
-        dstat("DAC0 КЛИП ↑", "dstat_cliphi0", 1)
-        dstat("DAC0 КЛИП ↓", "dstat_cliplo0", 2)
-        dstat("DAC0 ОГИБ.", "dstat_env0", 3)
-        dstat("DAC1 КЛИП ↑", "dstat_cliphi1", 4)
-        dstat("DAC1 КЛИП ↓", "dstat_cliplo1", 5)
-        dstat("DAC1 ОГИБ.", "dstat_env1", 6)
-        dstat("ОТСЧЕТЫ", "dstat_samps", 7)
-        v.addWidget(stats_frame)
-
-        # ── Raw serial log ────────────────────────────────────────────────────
-        log_header = QHBoxLayout()
-        log_lbl = QLabel("ЖУРНАЛ  SERIAL")
-        log_lbl.setObjectName("section_label")
-        log_header.addWidget(log_lbl)
-        log_header.addStretch()
-
-        self.dbg_checkbox = QCheckBox("Телеметрия платы (DBG ON)")
-        self.dbg_checkbox.setChecked(False)
-        self.dbg_checkbox.toggled.connect(self._toggle_dbg)
-        log_header.addWidget(self.dbg_checkbox)
-
-        self.autoscroll_cb = QCheckBox("Автопрокрутка")
-        self.autoscroll_cb.setChecked(True)
-        log_header.addWidget(self.autoscroll_cb)
-
-        clear_btn = QPushButton("ОЧИСТИТЬ")
-        clear_btn.setObjectName("clear_btn")
-        clear_btn.clicked.connect(self._clear_console)
-        log_header.addWidget(clear_btn)
-        v.addLayout(log_header)
-
-        self.console = QTextEdit()
-        self.console.setReadOnly(True)
-        self.console.setMinimumHeight(120)
-        v.addWidget(self.console, 1)
-
-        # Manual command input
-        cmd_row = QHBoxLayout()
-        self.cmd_input = QLineEdit()
-        self.cmd_input.setPlaceholderText("Отправить команду, например STATUS или DBG ON")
-        self.cmd_input.returnPressed.connect(self._send_manual_cmd)
-        cmd_row.addWidget(self.cmd_input, 1)
-        send_btn = QPushButton("ОТПР.")
-        send_btn.setFixedWidth(64)
-        send_btn.clicked.connect(self._send_manual_cmd)
-        cmd_row.addWidget(send_btn)
-        v.addLayout(cmd_row)
-
-        return w
-
     def _build_lsl_tab(self) -> QWidget:
         w = QWidget()
         v = QVBoxLayout(w)
@@ -735,32 +699,37 @@ class MainWindow(QMainWindow):
         stream_grid = QGridLayout(stream_box)
         stream_grid.setHorizontalSpacing(8)
         stream_grid.setVerticalSpacing(6)
+        stream_grid.setColumnStretch(0, 1)
 
         self.lsl_stream_combo = QComboBox()
         self.lsl_stream_combo.setMinimumWidth(360)
         self.lsl_stream_combo.currentIndexChanged.connect(self._update_lsl_stream_preview)
         self.lsl_stream_combo.activated.connect(self._connect_selected_lsl_stream)
-        stream_grid.addWidget(self.lsl_stream_combo, 0, 0, 1, 3)
+        stream_grid.addWidget(self.lsl_stream_combo, 0, 0)
 
-        self.lsl_refresh_btn = QPushButton("ОБНОВИТЬ")
-        self.lsl_refresh_btn.clicked.connect(self._refresh_lsl_streams)
-        stream_grid.addWidget(self.lsl_refresh_btn, 1, 0)
-
-        self.lsl_connect_check = QCheckBox("Отключено")
+        self.lsl_connect_check = QCheckBox()
+        self.lsl_connect_check.setObjectName("lsl_status")
         self.lsl_connect_check.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.lsl_connect_check.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        stream_grid.addWidget(self.lsl_connect_check, 1, 1, 1, 2)
+        self.lsl_connect_check.setToolTip("LSL не подключен")
+        self._set_lsl_indicator("disconnected")
+        stream_grid.addWidget(self.lsl_connect_check, 0, 1)
+
+        self.lsl_refresh_btn = QPushButton("Обновить")
+        self.lsl_refresh_btn.setMinimumWidth(96)
+        self.lsl_refresh_btn.clicked.connect(self._refresh_lsl_streams)
+        stream_grid.addWidget(self.lsl_refresh_btn, 0, 2)
 
         self.lsl_status_label = QLabel("Отключено")
         self.lsl_status_label.setStyleSheet(
             f"color:{COLORS['text_dim']};font-size:11px;background-color:transparent;"
         )
-        stream_grid.addWidget(self.lsl_status_label, 2, 0, 1, 3)
+        stream_grid.addWidget(self.lsl_status_label, 1, 0, 1, 3)
 
         self.lsl_meta_text = QTextEdit()
         self.lsl_meta_text.setReadOnly(True)
         self.lsl_meta_text.setMaximumHeight(120)
-        stream_grid.addWidget(self.lsl_meta_text, 3, 0, 1, 3)
+        stream_grid.addWidget(self.lsl_meta_text, 2, 0, 1, 3)
         v.addWidget(stream_box)
 
         filter_label = QLabel("ФИЛЬТРЫ  ЗАПИСИ")
@@ -825,20 +794,25 @@ class MainWindow(QMainWindow):
         self.port_combo.activated.connect(self._connect_selected_serial_port)
         lay.addWidget(self.port_combo)
 
-        refresh_btn = QPushButton("⟳")
-        refresh_btn.setFixedWidth(32)
-        refresh_btn.clicked.connect(self._refresh_ports)
-        lay.addWidget(refresh_btn)
-
-        self.serial_connect_check = QCheckBox("Отключено")
+        self.serial_connect_check = QCheckBox()
+        self.serial_connect_check.setObjectName("serial_status")
         self.serial_connect_check.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.serial_connect_check.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.serial_connect_check.setToolTip("Устройство не подключено")
+        self._set_serial_indicator("disconnected")
         lay.addWidget(self.serial_connect_check)
+
+        refresh_btn = QPushButton("Обновить")
+        refresh_btn.setMinimumWidth(96)
+        refresh_btn.setToolTip("Обновить список портов")
+        refresh_btn.clicked.connect(self._refresh_ports)
+        lay.addWidget(refresh_btn)
         return box
 
     def _build_sine_box(self, title: str, idx: str, color: str) -> QGroupBox:
         box = QGroupBox(title)
-        box.setStyleSheet(f"QGroupBox {{ border-color: {color}44; }}")
+        if idx == "1":
+            box.setStyleSheet(f"QGroupBox {{ border-color: {color}44; }}")
         grid = QGridLayout(box)
         grid.setHorizontalSpacing(10)
         grid.setVerticalSpacing(6)
@@ -870,7 +844,8 @@ class MainWindow(QMainWindow):
 
     def _build_dac_box(self, title: str, attr_prefix: str, color: str) -> QGroupBox:
         box = QGroupBox(title)
-        box.setStyleSheet(f"QGroupBox {{ border-color: {color}44; }}")
+        if attr_prefix == "dac0":
+            box.setStyleSheet(f"QGroupBox {{ border-color: {color}44; }}")
         grid = QGridLayout(box)
         grid.setHorizontalSpacing(10)
         grid.setVerticalSpacing(6)
@@ -1010,6 +985,93 @@ class MainWindow(QMainWindow):
         stat("НАЙКВИСТ", "stat_nyquist", 6)
         layout.addWidget(frame)
 
+    def _set_status_indicator(self, widget: QCheckBox, state: str, tooltip: str):
+        color = {
+            "disconnected": COLORS["red"],
+            "connecting": COLORS["yellow"],
+            "connected": COLORS["green"],
+        }[state]
+        widget.blockSignals(True)
+        widget.setChecked(state == "connected")
+        widget.setToolTip(tooltip)
+        widget.blockSignals(False)
+        widget.setStyleSheet(
+            f"QCheckBox#{widget.objectName()} {{ spacing: 0px; }}"
+            f"QCheckBox#{widget.objectName()}::indicator {{"
+            f" width: 14px; height: 14px;"
+            f" border: 1px solid {color};"
+            f" border-radius: 3px;"
+            f" background: {color};"
+            f" }}"
+        )
+
+    def _set_serial_indicator(self, state: str):
+        tooltips = {
+            "disconnected": "Устройство не подключено",
+            "connecting": "Подключение к устройству...",
+            "connected": "Устройство подключено",
+        }
+        self._set_status_indicator(self.serial_connect_check, state, tooltips[state])
+
+    def _set_lsl_indicator(self, state: str):
+        tooltips = {
+            "disconnected": "LSL не подключен",
+            "connecting": "Подключение к LSL...",
+            "connected": "LSL подключен",
+        }
+        self._set_status_indicator(self.lsl_connect_check, state, tooltips[state])
+
+    def _valid_serial_port_selected(self) -> bool:
+        port = self.port_combo.currentText()
+        return bool(port) and "no ports" not in port and "порты не найдены" not in port
+
+    def _valid_lsl_stream_selected(self) -> bool:
+        idx = self.lsl_stream_combo.currentIndex()
+        return 0 <= idx < len(self.lsl_streams)
+
+    def _save_serial_selection(self, port: str):
+        self.settings.setValue("serial/port", port)
+
+    def _restore_serial_selection(self):
+        saved_port = str(self.settings.value("serial/port", "", type=str))
+        if not saved_port:
+            return
+        idx = self.port_combo.findText(saved_port)
+        if idx >= 0:
+            self.port_combo.setCurrentIndex(idx)
+
+    def _lsl_stream_key_from_meta(self, meta: dict) -> str:
+        return meta.get("source_id") or meta.get("uid") or "|".join(
+            [
+                str(meta.get("name", "")),
+                str(meta.get("type", "")),
+                str(meta.get("channel_count", 0)),
+                str(meta.get("nominal_srate_hz", 0.0)),
+            ]
+        )
+
+    def _save_lsl_selection(self, idx: int):
+        if idx < 0 or idx >= len(self.lsl_streams):
+            return
+        meta = self._read_lsl_stream_meta(self.lsl_streams[idx])
+        self.settings.setValue("lsl/stream_key", self._lsl_stream_key_from_meta(meta))
+
+    def _restore_lsl_selection(self):
+        saved_key = str(self.settings.value("lsl/stream_key", "", type=str))
+        if not saved_key:
+            return
+        for idx, info in enumerate(self.lsl_streams):
+            meta = self._read_lsl_stream_meta(info)
+            if self._lsl_stream_key_from_meta(meta) == saved_key:
+                self.lsl_stream_combo.setCurrentIndex(idx)
+                return
+
+    def _attempt_initial_connections(self):
+        if not self.serial.is_open and self._valid_serial_port_selected():
+            self._connect_selected_serial_port()
+        if self.lsl_inlet is None and self._valid_lsl_stream_selected():
+            self._connect_selected_lsl_stream()
+
     # ── Port helpers ──────────────────────────────────────────────────────────
     def _refresh_ports(self):
         self.port_combo.clear()
@@ -1018,6 +1080,7 @@ class MainWindow(QMainWindow):
             self.port_combo.addItem(p.device)
         if not ports:
             self.port_combo.addItem("(порты не найдены)")
+        self._restore_serial_selection()
 
     def _connect_selected_serial_port(self, idx: int | None = None):
         port = self.port_combo.currentText()
@@ -1032,8 +1095,11 @@ class MainWindow(QMainWindow):
             else:
                 self.serial.close()
 
+        self._save_serial_selection(port)
+        self._set_serial_indicator("connecting")
         self.status_bar.showMessage(f"Подключение к {port} …")
         self._log(f"Подключение к {port} @ 115200 …", COLORS["accent"])
+        QApplication.processEvents()
         ok = self.serial.open(port)
         if ok:
             self.status_bar.showMessage(f"Подключено  ·  {port}  @  115200 бод")
@@ -1077,6 +1143,7 @@ class MainWindow(QMainWindow):
                 f"{meta['name']} | {meta['type']} | "
                 f"{meta['channel_count']} кан. | {meta['nominal_srate_hz']} Гц"
             )
+        self._restore_lsl_selection()
         self.lsl_status_label.setText(f"Найдено LSL-потоков: {len(self.lsl_streams)}")
         self._set_lsl_checkbox(self.lsl_inlet is not None, enabled=True)
         self._update_lsl_stream_preview()
@@ -1113,6 +1180,10 @@ class MainWindow(QMainWindow):
             self._set_lsl_checkbox(False, enabled=bool(self.lsl_streams))
             return
 
+        self._save_lsl_selection(idx)
+        self._set_lsl_indicator("connecting")
+        self.lsl_status_label.setText("Подключение к LSL-потоку...")
+        QApplication.processEvents()
         try:
             info = self.lsl_streams[idx]
             self.lsl_inlet = StreamInlet(info, max_buflen=60)
@@ -1168,11 +1239,8 @@ class MainWindow(QMainWindow):
             self._disconnect_lsl_stream()
 
     def _set_lsl_checkbox(self, checked: bool, enabled: bool = True):
-        self.lsl_connect_check.blockSignals(True)
-        self.lsl_connect_check.setChecked(checked)
-        self.lsl_connect_check.setText("Подключено" if checked else "Отключено")
-        self.lsl_connect_check.setEnabled(True)
-        self.lsl_connect_check.blockSignals(False)
+        self.lsl_connect_check.setEnabled(enabled)
+        self._set_lsl_indicator("connected" if checked else "disconnected")
 
     def _read_lsl_stream_meta(self, info) -> dict:
         def read(method_name: str, default):
@@ -2154,10 +2222,7 @@ class MainWindow(QMainWindow):
         )
 
     def _set_serial_checkbox(self, checked: bool):
-        self.serial_connect_check.blockSignals(True)
-        self.serial_connect_check.setChecked(checked)
-        self.serial_connect_check.setText("Подключено" if checked else "Отключено")
-        self.serial_connect_check.blockSignals(False)
+        self._set_serial_indicator("connected" if checked else "disconnected")
 
     def _send(self, cmd: str) -> str | None:
         resp = self.serial.send(cmd)

@@ -73,6 +73,8 @@ from PySide6.QtWidgets import (
     QTabWidget,
     QFileDialog,
     QProgressBar,
+    QScrollArea,
+    QSizePolicy,
     QTableWidget,
     QTableWidgetItem,
     QHeaderView,
@@ -384,8 +386,10 @@ class SerialWorker(QObject):
 # ── Sequence model ────────────────────────────────────────────────────────────
 @dataclass(frozen=True)
 class SequenceStep:
-    f1: float
-    f2: float | None
+    dac0_f1: float
+    dac0_f2: float
+    dac1_f1: float
+    dac1_f2: float
     seconds: float
 
 
@@ -452,8 +456,10 @@ class LSLRecordingWorker(threading.Thread):
                         "app_timestamp": time.time(),
                         "sample": [float(v) for v in sample],
                         "stim_step_index": stim["step_index"],
-                        "stim_f1_hz": stim["f1_hz"],
-                        "stim_f2_hz": stim["f2_hz"],
+                        "stim_dac0_f1_hz": stim["dac0_f1_hz"],
+                        "stim_dac0_f2_hz": stim["dac0_f2_hz"],
+                        "stim_dac1_f1_hz": stim["dac1_f1_hz"],
+                        "stim_dac1_f2_hz": stim["dac1_f2_hz"],
                     }
                 )
 
@@ -494,7 +500,6 @@ class MainWindow(QMainWindow):
         self._sequence_stage_duration = 0.0
         self._sequence_stage_start_time: float | None = None
         self._sequence_stage_number = 0
-        self._sequence_a2_restore_needed = False
 
         self.lsl_streams = []
         self.lsl_inlet = None
@@ -508,8 +513,10 @@ class MainWindow(QMainWindow):
         self._stim_events: list[dict] = []
         self._current_stim = {
             "step_index": -1,
-            "f1_hz": np.nan,
-            "f2_hz": np.nan,
+            "dac0_f1_hz": np.nan,
+            "dac0_f2_hz": np.nan,
+            "dac1_f1_hz": np.nan,
+            "dac1_f2_hz": np.nan,
         }
         self._recording_active = False
         self._record_start_app_time: float | None = None
@@ -527,8 +534,8 @@ class MainWindow(QMainWindow):
         self._drain_timer.start(50)  # 20 Hz poll
 
         # Clip counters for stats panel
-        self._total_clip_hi = 0
-        self._total_clip_lo = 0
+        self._total_clip_hi = [0, 0]
+        self._total_clip_lo = [0, 0]
 
     # ── UI construction ───────────────────────────────────────────────────────
     def _build_ui(self):
@@ -538,12 +545,13 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(12)
 
-        # Left panel
         left = QVBoxLayout()
         left.setSpacing(10)
         left.addWidget(self._build_connection_box())
         left.addWidget(self._build_sine_box("СИНУС  1", "1", COLORS["sine1"]))
         left.addWidget(self._build_sine_box("СИНУС  2", "2", COLORS["sine2"]))
+        left.addWidget(self._build_dac_box("DAC0", "dac0", COLORS["accent"]))
+        left.addWidget(self._build_dac_box("DAC1", "dac1", COLORS["combined"]))
         left.addWidget(self._build_sequence_box())
         left.addWidget(self._build_global_box())
         left.addWidget(self._build_transport_box())
@@ -551,9 +559,18 @@ class MainWindow(QMainWindow):
 
         left_w = QWidget()
         left_w.setLayout(left)
-        left_w.setFixedWidth(360)
+        left_w.adjustSize()
+        left_w.setMinimumWidth(left_w.sizeHint().width())
+        left_w.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
 
-        # Right panel: tabbed (Preview / Debug)
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        left_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        left_scroll.setWidget(left_w)
+        left_scroll.setMinimumWidth(left_w.minimumSizeHint().width() + 28)
+        left_scroll.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+
         right = QVBoxLayout()
         right.setSpacing(8)
 
@@ -568,7 +585,7 @@ class MainWindow(QMainWindow):
         right_w = QWidget()
         right_w.setLayout(right)
 
-        root.addWidget(left_w)
+        root.addWidget(left_scroll)
         root.addWidget(right_w, 1)
 
         self.status_bar = QStatusBar()
@@ -585,9 +602,9 @@ class MainWindow(QMainWindow):
         lbl.setObjectName("section_label")
         v.addWidget(lbl)
 
-        self.sequence_table = QTableWidget(0, 4)
+        self.sequence_table = QTableWidget(0, 6)
         self.sequence_table.setHorizontalHeaderLabels(
-            ["№ этапа", "Частота 1", "Частота 2", "Оставшееся время"]
+            ["№ этапа", "DAC0 F1", "DAC0 F2", "DAC1 F1", "DAC1 F2", "Оставшееся время"]
         )
         self.sequence_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.sequence_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
@@ -654,10 +671,13 @@ class MainWindow(QMainWindow):
             sg.addWidget(vl, 1, col)
 
         dstat("ISR, мкс", "dstat_isr", 0)
-        dstat("КЛИП ↑", "dstat_cliphi", 1)
-        dstat("КЛИП ↓", "dstat_cliplo", 2)
-        dstat("ОТСЧЕТЫ", "dstat_samps", 3)
-        dstat("УСИЛ. ОГИБ.", "dstat_env", 4)
+        dstat("DAC0 КЛИП ↑", "dstat_cliphi0", 1)
+        dstat("DAC0 КЛИП ↓", "dstat_cliplo0", 2)
+        dstat("DAC0 ОГИБ.", "dstat_env0", 3)
+        dstat("DAC1 КЛИП ↑", "dstat_cliphi1", 4)
+        dstat("DAC1 КЛИП ↓", "dstat_cliplo1", 5)
+        dstat("DAC1 ОГИБ.", "dstat_env1", 6)
+        dstat("ОТСЧЕТЫ", "dstat_samps", 7)
         v.addWidget(stats_frame)
 
         # ── Raw serial log ────────────────────────────────────────────────────
@@ -834,22 +854,44 @@ class MainWindow(QMainWindow):
 
         if idx == "1":
             self.amp1 = make_spinbox(0, 1.65, 3, 0.05, 0.5, "В")
-            self.freq1 = make_spinbox(0, 5000, 2, 10.0, 100.0, "Гц")
             self.phase1 = make_spinbox(-360, 360, 1, 5.0, 0.0, "°")
-            for c in (self.amp1, self.freq1, self.phase1):
+            for c in (self.amp1, self.phase1):
                 c.valueChanged.connect(self._param_changed)
             row("Амплитуда", self.amp1)
-            row("Частота", self.freq1)
             row("Фаза", self.phase1)
         else:
             self.amp2 = make_spinbox(0, 1.65, 3, 0.05, 0.5, "В")
-            self.freq2 = make_spinbox(0, 5000, 2, 10.0, 200.0, "Гц")
             self.phase2 = make_spinbox(-360, 360, 1, 5.0, 0.0, "°")
-            for c in (self.amp2, self.freq2, self.phase2):
+            for c in (self.amp2, self.phase2):
                 c.valueChanged.connect(self._param_changed)
             row("Амплитуда", self.amp2)
-            row("Частота", self.freq2)
             row("Фаза", self.phase2)
+        return box
+
+    def _build_dac_box(self, title: str, attr_prefix: str, color: str) -> QGroupBox:
+        box = QGroupBox(title)
+        box.setStyleSheet(f"QGroupBox {{ border-color: {color}44; }}")
+        grid = QGridLayout(box)
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(6)
+
+        def row(label, widget):
+            r = grid.rowCount()
+            lbl = QLabel(label)
+            lbl.setStyleSheet(
+                f"color:{COLORS['text_dim']};font-size:14px;background-color:transparent;"
+            )
+            grid.addWidget(lbl, r, 0)
+            grid.addWidget(widget, r, 1)
+
+        freq1 = make_spinbox(0, 5000, 2, 10.0, 100.0, "Гц")
+        freq2 = make_spinbox(0, 5000, 2, 10.0, 200.0, "Гц")
+        freq1.valueChanged.connect(self._param_changed)
+        freq2.valueChanged.connect(self._param_changed)
+        setattr(self, f"{attr_prefix}_f1", freq1)
+        setattr(self, f"{attr_prefix}_f2", freq2)
+        row("Частота 1", freq1)
+        row("Частота 2", freq2)
         return box
 
     def _build_sequence_box(self) -> QGroupBox:
@@ -863,7 +905,7 @@ class MainWindow(QMainWindow):
         self.sequence_path_edit.setPlaceholderText("Файл последовательности не загружен")
         grid.addWidget(self.sequence_path_edit, 0, 0, 1, 2)
 
-        self.sequence_status = QLabel("Формат: F1 секунды или F1 F2 секунды")
+        self.sequence_status = QLabel("Формат: DAC0_F1 DAC0_F2 DAC1_F1 DAC1_F2 секунды")
         self.sequence_status.setStyleSheet(
             f"color:{COLORS['text_dim']};font-size:10px;background-color:transparent;"
         )
@@ -895,7 +937,7 @@ class MainWindow(QMainWindow):
             grid.addWidget(lbl, r, 0)
             grid.addWidget(widget, r, 1)
 
-        self.dc_offset = make_spinbox(0, 3.3, 3, 0.05, 1.65, "В")
+        self.dc_offset = make_spinbox(0, 3.3, 3, 0.05, 2.0, "В")
         self.sample_rate = QSpinBox()
         self.sample_rate.setRange(100, 10000)
         self.sample_rate.setValue(1000)
@@ -959,10 +1001,13 @@ class MainWindow(QMainWindow):
             grid.addWidget(lb, 0, col)
             grid.addWidget(vl, 1, col)
 
-        stat("ПИК", "stat_peak", 0)
-        stat("МИНИМУМ", "stat_trough", 1)
-        stat("РАЗМАХ", "stat_range", 2)
-        stat("НАЙКВИСТ", "stat_nyquist", 3)
+        stat("DAC0 ПИК", "stat_dac0_peak", 0)
+        stat("DAC0 МИН", "stat_dac0_trough", 1)
+        stat("DAC0 РАЗМАХ", "stat_dac0_range", 2)
+        stat("DAC1 ПИК", "stat_dac1_peak", 3)
+        stat("DAC1 МИН", "stat_dac1_trough", 4)
+        stat("DAC1 РАЗМАХ", "stat_dac1_range", 5)
+        stat("НАЙКВИСТ", "stat_nyquist", 6)
         layout.addWidget(frame)
 
     # ── Port helpers ──────────────────────────────────────────────────────────
@@ -1183,11 +1228,13 @@ class MainWindow(QMainWindow):
     def _get_params(self) -> dict:
         return {
             "a1": self.amp1.value(),
-            "f1": self.freq1.value(),
             "p1": self.phase1.value(),
             "a2": self.amp2.value(),
-            "f2": self.freq2.value(),
             "p2": self.phase2.value(),
+            "dac0_f1": self.dac0_f1.value(),
+            "dac0_f2": self.dac0_f2.value(),
+            "dac1_f1": self.dac1_f1.value(),
+            "dac1_f2": self.dac1_f2.value(),
             "dc": self.dc_offset.value(),
             "sr": self.sample_rate.value(),
             "gain_max": self.gain_max.value(),
@@ -1221,7 +1268,7 @@ class MainWindow(QMainWindow):
         self.sequence_path_edit.setText(Path(path).name)
         self.sequence_path_edit.setToolTip(path)
         self.sequence_status.setText(
-            f"Шагов: {len(steps)} | всего: {total_seconds:.3f} с | частоты UI игнорируются"
+            f"Шагов: {len(steps)} | всего: {total_seconds:.3f} с | частоты DAC0/DAC1 игнорируются"
         )
         self.sequence_clear_btn.setEnabled(True)
         self._set_frequency_controls_enabled(False)
@@ -1242,12 +1289,12 @@ class MainWindow(QMainWindow):
         self._sequence_index = 0
         self.sequence_path_edit.clear()
         self.sequence_path_edit.setToolTip("")
-        self.sequence_status.setText("Формат: F1 секунды или F1 F2 секунды")
+        self.sequence_status.setText("Формат: DAC0_F1 DAC0_F2 DAC1_F1 DAC1_F2 секунды")
         self.sequence_clear_btn.setEnabled(False)
         self._set_frequency_controls_enabled(True)
         self._populate_sequence_table()
         self._reset_sequence_progress()
-        self._log("Файл частот сброшен. Поля F1/F2 снова активны.", COLORS["text_dim"])
+        self._log("Файл частот сброшен. Поля DAC0/DAC1 снова активны.", COLORS["text_dim"])
 
     def _parse_sequence_file(self, path: str) -> list[SequenceStep]:
         steps = []
@@ -1262,9 +1309,12 @@ class MainWindow(QMainWindow):
                     continue
 
                 parts = [p for p in re.split(r"[\s,;]+", line) if p]
-                if len(parts) not in (2, 3):
+                if len(parts) != 5:
                     errors.append(
-                        f"строка {line_no}: ожидалось 2 или 3 значения (F1 секунды или F1 F2 секунды), получено {len(parts)}"
+                        "строка "
+                        f"{line_no}: ожидалось 5 значений "
+                        "(DAC0_F1 DAC0_F2 DAC1_F1 DAC1_F2 секунды), "
+                        f"получено {len(parts)}"
                     )
                     continue
 
@@ -1274,19 +1324,23 @@ class MainWindow(QMainWindow):
                     errors.append(f"строка {line_no}: значения должны быть числами")
                     continue
 
-                if len(values) == 2:
-                    f1, seconds = values
-                    f2 = None
-                else:
-                    f1, f2, seconds = values
-
-                if not (0 <= f1 <= 5000) or (f2 is not None and not (0 <= f2 <= 5000)):
+                dac0_f1, dac0_f2, dac1_f1, dac1_f2, seconds = values
+                freqs = (dac0_f1, dac0_f2, dac1_f1, dac1_f2)
+                if any(not (0 <= freq <= 5000) for freq in freqs):
                     errors.append(f"строка {line_no}: частоты должны быть в диапазоне 0..5000 Гц")
                     continue
                 if seconds <= 0:
                     errors.append(f"строка {line_no}: длительность должна быть больше 0")
                     continue
-                steps.append(SequenceStep(f1=f1, f2=f2, seconds=seconds))
+                steps.append(
+                    SequenceStep(
+                        dac0_f1=dac0_f1,
+                        dac0_f2=dac0_f2,
+                        dac1_f1=dac1_f1,
+                        dac1_f2=dac1_f2,
+                        seconds=seconds,
+                    )
+                )
 
         if errors:
             preview = "; ".join(errors[:5])
@@ -1298,7 +1352,7 @@ class MainWindow(QMainWindow):
         return steps
 
     def _set_frequency_controls_enabled(self, enabled: bool):
-        for widget in (self.freq1, self.freq2):
+        for widget in (self.dac0_f1, self.dac0_f2, self.dac1_f1, self.dac1_f2):
             widget.setEnabled(enabled)
 
     def _sequence_total_seconds(self) -> float:
@@ -1329,8 +1383,10 @@ class MainWindow(QMainWindow):
         for row, step in enumerate(self.sequence_steps):
             values = [
                 str(row + 1),
-                self._format_step_frequency(step.f1),
-                self._format_step_frequency(step.f2),
+                self._format_step_frequency(step.dac0_f1),
+                self._format_step_frequency(step.dac0_f2),
+                self._format_step_frequency(step.dac1_f1),
+                self._format_step_frequency(step.dac1_f2),
                 self._format_seconds(step.seconds),
             ]
             for col, value in enumerate(values):
@@ -1342,13 +1398,13 @@ class MainWindow(QMainWindow):
         row = step_no - 1
         if row < 0 or row >= self.sequence_table.rowCount():
             return
-        item = self.sequence_table.item(row, 3)
+        item = self.sequence_table.item(row, 5)
         if item is not None:
             item.setText(text)
 
     def _reset_sequence_table_remaining(self):
         for row, step in enumerate(self.sequence_steps):
-            item = self.sequence_table.item(row, 3)
+            item = self.sequence_table.item(row, 5)
             if item is not None:
                 item.setText(self._format_seconds(step.seconds))
 
@@ -1451,7 +1507,7 @@ class MainWindow(QMainWindow):
         self.stage_time_bar.setFormat("Этап: завершен")
         self.total_time_bar.setFormat("Эксперимент: завершен")
         for row in range(self.sequence_table.rowCount()):
-            item = self.sequence_table.item(row, 3)
+            item = self.sequence_table.item(row, 5)
             if item is not None:
                 item.setText("00:00")
         self._style_sequence_table(completed_until=len(self.sequence_steps))
@@ -1533,20 +1589,30 @@ class MainWindow(QMainWindow):
                 return False
         return True
 
-    def _set_current_stim(self, step_index: int, f1: float, f2: float | None):
-        f2_value = np.nan if f2 is None else float(f2)
+    def _set_current_stim(
+        self,
+        step_index: int,
+        dac0_f1: float,
+        dac0_f2: float,
+        dac1_f1: float,
+        dac1_f2: float,
+    ):
         event = {
             "step_index": int(step_index),
-            "f1_hz": float(f1),
-            "f2_hz": f2_value,
+            "dac0_f1_hz": float(dac0_f1),
+            "dac0_f2_hz": float(dac0_f2),
+            "dac1_f1_hz": float(dac1_f1),
+            "dac1_f2_hz": float(dac1_f2),
             "app_timestamp": time.time(),
             "lsl_timestamp": float(local_clock()) if local_clock else np.nan,
         }
         with self._stim_lock:
             self._current_stim = {
                 "step_index": event["step_index"],
-                "f1_hz": event["f1_hz"],
-                "f2_hz": event["f2_hz"],
+                "dac0_f1_hz": event["dac0_f1_hz"],
+                "dac0_f2_hz": event["dac0_f2_hz"],
+                "dac1_f1_hz": event["dac1_f1_hz"],
+                "dac1_f2_hz": event["dac1_f2_hz"],
             }
             self._stim_events.append(event)
 
@@ -1554,7 +1620,14 @@ class MainWindow(QMainWindow):
         with self._stim_lock:
             return dict(self._current_stim)
 
-    def _begin_lsl_recording(self, step_index: int, f1: float, f2: float | None) -> bool:
+    def _begin_lsl_recording(
+        self,
+        step_index: int,
+        dac0_f1: float,
+        dac0_f2: float,
+        dac1_f1: float,
+        dac1_f2: float,
+    ) -> bool:
         if self.lsl_inlet is None:
             self._log("Не удалось начать запись: LSL-поток не подключен.", COLORS["red"])
             return False
@@ -1575,7 +1648,7 @@ class MainWindow(QMainWindow):
         self._record_sequence_steps = list(self.sequence_steps)
         self._record_start_app_time = time.time()
         self._record_end_app_time = None
-        self._set_current_stim(step_index, f1, f2)
+        self._set_current_stim(step_index, dac0_f1, dac0_f2, dac1_f1, dac1_f2)
 
         try:
             self.lsl_inlet.flush()
@@ -1690,8 +1763,10 @@ class MainWindow(QMainWindow):
                 "export_split_by_step": True,
                 "export_step_index": step_no,
                 "export_step_total": total_steps,
-                "export_step_f1_hz": step.f1,
-                "export_step_f2_hz": np.nan if step.f2 is None else step.f2,
+                "export_step_dac0_f1_hz": step.dac0_f1,
+                "export_step_dac0_f2_hz": step.dac0_f2,
+                "export_step_dac1_f1_hz": step.dac1_f1,
+                "export_step_dac1_f2_hz": step.dac1_f2,
                 "export_step_duration_s": step.seconds,
                 "export_step_records": len(step_records),
             }
@@ -1743,8 +1818,10 @@ class MainWindow(QMainWindow):
             "lsl_timestamp": [r["lsl_timestamp"] for r in records],
             "app_timestamp": [r["app_timestamp"] for r in records],
             "stim_step_index": [r["stim_step_index"] for r in records],
-            "stim_f1_hz": [r["stim_f1_hz"] for r in records],
-            "stim_f2_hz": [r["stim_f2_hz"] for r in records],
+            "stim_dac0_f1_hz": [r["stim_dac0_f1_hz"] for r in records],
+            "stim_dac0_f2_hz": [r["stim_dac0_f2_hz"] for r in records],
+            "stim_dac1_f1_hz": [r["stim_dac1_f1_hz"] for r in records],
+            "stim_dac1_f2_hz": [r["stim_dac1_f2_hz"] for r in records],
             "lsl_stream_name": repeat(stream_meta.get("name", "")),
             "lsl_stream_type": repeat(stream_meta.get("type", "")),
             "lsl_source_id": repeat(stream_meta.get("source_id", "")),
@@ -1798,8 +1875,10 @@ class MainWindow(QMainWindow):
         return [
             {
                 "step_index": idx,
-                "f1_hz": step.f1,
-                "f2_hz": np.nan if step.f2 is None else step.f2,
+                "dac0_f1_hz": step.dac0_f1,
+                "dac0_f2_hz": step.dac0_f2,
+                "dac1_f1_hz": step.dac1_f1,
+                "dac1_f2_hz": step.dac1_f2,
                 "duration_s": step.seconds,
             }
             for idx, step in enumerate(steps, 1)
@@ -1862,44 +1941,51 @@ class MainWindow(QMainWindow):
             f.write("\n# DATA\n")
             data_df.to_csv(f, sep="\t", index=False, lineterminator="\n")
 
-    def _check_clipping(self, p: dict) -> str:
-        g = p["gain_max"]
-        hi = p["dc"] + g * (p["a1"] + p["a2"])
-        lo = p["dc"] - g * (p["a1"] + p["a2"])
-        w = []
-        if hi > 3.3:
-            w.append(f"⚠ пик до +{hi:.3f} В (ограничение)")
-        if lo < 0.0:
-            w.append(f"⚠ минимум до {lo:.3f} В (ограничение)")
-        return "  ".join(w)
-
-    # ── Signal stats refresh ──────────────────────────────────────────────────
-    def _refresh_signal_stats(self):
-        p = self._get_params()
-        self.clip_label.setText(self._check_clipping(p))
-
-        t = np.linspace(0, 0.1, 50000)
-        denom = np.sin(np.pi * (p["f2"] - p["f1"]) * t + np.pi / 2)
+    def _build_channel_signal(self, p: dict, f1: float, f2: float, t: np.ndarray):
+        denom = np.sin(np.pi * (f2 - f1) * t + np.pi / 2)
         with np.errstate(divide="ignore", invalid="ignore"):
             env = np.where(
                 np.abs(denom) < 1e-9,
                 p["gain_max"],
                 np.clip(np.abs(1.0 / denom), 0, p["gain_max"]),
             )
-        s = np.clip(
+        raw = (
             p["dc"]
             + env
             * (
-                p["a1"] * np.sin(2 * np.pi * p["f1"] * t + np.radians(p["p1"]))
-                + p["a2"] * np.sin(2 * np.pi * p["f2"] * t + np.radians(p["p2"]))
-            ),
-            0,
-            3.3,
+                p["a1"] * np.sin(2 * np.pi * f1 * t + np.radians(p["p1"]))
+                + p["a2"] * np.sin(2 * np.pi * f2 * t + np.radians(p["p2"]))
+            )
         )
+        return raw, np.clip(raw, 0, 3.3)
 
-        self.stat_peak.setText(f"{np.max(s):.3f} В")
-        self.stat_trough.setText(f"{np.min(s):.3f} В")
-        self.stat_range.setText(f"{np.max(s)-np.min(s):.3f} В")
+    def _check_clipping(self, raw0: np.ndarray, raw1: np.ndarray) -> str:
+        warnings = []
+        for label, raw in (("DAC0", raw0), ("DAC1", raw1)):
+            parts = []
+            hi = float(np.max(raw))
+            lo = float(np.min(raw))
+            if hi > 3.3:
+                parts.append(f"пик до +{hi:.3f} В")
+            if lo < 0.0:
+                parts.append(f"минимум до {lo:.3f} В")
+            if parts:
+                warnings.append(f"{label}: " + ", ".join(parts))
+        return "  |  ".join(warnings)
+
+    def _refresh_signal_stats(self):
+        p = self._get_params()
+        t = np.linspace(0, 0.1, 50000)
+        raw0, sig0 = self._build_channel_signal(p, p["dac0_f1"], p["dac0_f2"], t)
+        raw1, sig1 = self._build_channel_signal(p, p["dac1_f1"], p["dac1_f2"], t)
+        self.clip_label.setText(self._check_clipping(raw0, raw1))
+
+        self.stat_dac0_peak.setText(f"{np.max(sig0):.3f} В")
+        self.stat_dac0_trough.setText(f"{np.min(sig0):.3f} В")
+        self.stat_dac0_range.setText(f"{np.max(sig0) - np.min(sig0):.3f} В")
+        self.stat_dac1_peak.setText(f"{np.max(sig1):.3f} В")
+        self.stat_dac1_trough.setText(f"{np.min(sig1):.3f} В")
+        self.stat_dac1_range.setText(f"{np.max(sig1) - np.min(sig1):.3f} В")
         self.stat_nyquist.setText(f"{p['sr']/2:.0f} Гц")
 
     # ── Serial telemetry drain (20 Hz) ────────────────────────────────────────
@@ -1916,30 +2002,44 @@ class MainWindow(QMainWindow):
             return
 
         if d.get("dbg"):
-            self._total_clip_hi += int(d.get("clipHi", 0))
-            self._total_clip_lo += int(d.get("clipLo", 0))
+            self._total_clip_hi[0] += int(d.get("clipHi0", 0))
+            self._total_clip_hi[1] += int(d.get("clipHi1", 0))
+            self._total_clip_lo[0] += int(d.get("clipLo0", 0))
+            self._total_clip_lo[1] += int(d.get("clipLo1", 0))
             self.dstat_isr.setText(f"{d.get('isrUs', '?')} мкс")
-            self.dstat_cliphi.setText(str(self._total_clip_hi))
-            self.dstat_cliplo.setText(str(self._total_clip_lo))
+            self.dstat_cliphi0.setText(str(self._total_clip_hi[0]))
+            self.dstat_cliplo0.setText(str(self._total_clip_lo[0]))
+            self.dstat_cliphi1.setText(str(self._total_clip_hi[1]))
+            self.dstat_cliplo1.setText(str(self._total_clip_lo[1]))
             self.dstat_samps.setText(str(d.get("samps", "?")))
-            self.dstat_env.setText(f"{float(d.get('env', 0)):.3f}")
+            self.dstat_env0.setText(f"{float(d.get('env0', 0)):.3f}")
+            self.dstat_env1.setText(f"{float(d.get('env1', 0)):.3f}")
 
-            # Highlight clips in red if nonzero this window
-            clip_color = (
-                COLORS["red"]
-                if (d.get("clipHi", 0) or d.get("clipLo", 0))
-                else COLORS["text_dim"]
-            )
-            for lbl in (self.dstat_cliphi, self.dstat_cliplo):
-                lbl.setStyleSheet(
-                    f"color:{clip_color};font-family:'JetBrains Mono';font-size:11px;"
-                )
+            for clip_hi, clip_lo, labels in (
+                (
+                    int(d.get("clipHi0", 0)),
+                    int(d.get("clipLo0", 0)),
+                    (self.dstat_cliphi0, self.dstat_cliplo0),
+                ),
+                (
+                    int(d.get("clipHi1", 0)),
+                    int(d.get("clipLo1", 0)),
+                    (self.dstat_cliphi1, self.dstat_cliplo1),
+                ),
+            ):
+                clip_color = COLORS["red"] if (clip_hi or clip_lo) else COLORS["text_dim"]
+                for lbl in labels:
+                    lbl.setStyleSheet(
+                        f"color:{clip_color};font-family:'JetBrains Mono';font-size:11px;"
+                    )
 
-            # Log to console with compact format
             self._log(
-                f"[DBG] V={d['v']:.3f}В  огиб={d['env']:.3f}  "
-                f"пик={d['peak']:.3f}  мин={d['trough']:.3f}  "
-                f"клип↑={d['clipHi']}  клип↓={d['clipLo']}  "
+                f"[DBG] DAC0 V={d['v0']:.3f}В  огиб={d['env0']:.3f}  "
+                f"пик={d['peak0']:.3f}  мин={d['trough0']:.3f}  "
+                f"клип↑={d['clipHi0']}  клип↓={d['clipLo0']}  "
+                f"DAC1 V={d['v1']:.3f}В  огиб={d['env1']:.3f}  "
+                f"пик={d['peak1']:.3f}  мин={d['trough1']:.3f}  "
+                f"клип↑={d['clipHi1']}  клип↓={d['clipLo1']}  "
                 f"ISR={d['isrUs']}мкс  n={d['samps']}",
                 COLORS["text_dim"],
             )
@@ -1982,16 +2082,23 @@ class MainWindow(QMainWindow):
 
     def _clear_console(self):
         self.console.clear()
-        self._total_clip_hi = 0
-        self._total_clip_lo = 0
+        self._total_clip_hi = [0, 0]
+        self._total_clip_lo = [0, 0]
         for attr in (
             "dstat_isr",
-            "dstat_cliphi",
-            "dstat_cliplo",
+            "dstat_cliphi0",
+            "dstat_cliplo0",
+            "dstat_env0",
+            "dstat_cliphi1",
+            "dstat_cliplo1",
+            "dstat_env1",
             "dstat_samps",
-            "dstat_env",
         ):
             getattr(self, attr).setText("—")
+        for attr in ("dstat_cliphi0", "dstat_cliplo0", "dstat_cliphi1", "dstat_cliplo1"):
+            getattr(self, attr).setStyleSheet(
+                f"color:{COLORS['text_dim']};font-family:'JetBrains Mono';font-size:11px;"
+            )
 
     def _send_manual_cmd(self):
         cmd = self.cmd_input.text().strip()
@@ -2006,7 +2113,7 @@ class MainWindow(QMainWindow):
     def _toggle_dbg(self, enabled: bool):
         cmd = "DBG ON" if enabled else "DBG OFF"
         self._log(f"→ {cmd}", COLORS["accent2"])
-        resp = self._send(cmd)
+        self._send(cmd)
 
     # ── Serial actions ────────────────────────────────────────────────────────
     def _toggle_connect(self, checked: bool):
@@ -2062,22 +2169,36 @@ class MainWindow(QMainWindow):
         self._apply_params(include_frequencies=not bool(self.sequence_steps))
         if self.sequence_steps:
             self._log(
-                "Поля частот UI игнорируются, потому что загружен файл последовательности.",
+                "Поля частот DAC0/DAC1 игнорируются, потому что загружен файл последовательности.",
                 COLORS["text_dim"],
             )
+
+    def _frequency_commands(
+        self,
+        dac0_f1: float,
+        dac0_f2: float,
+        dac1_f1: float,
+        dac1_f2: float,
+    ) -> list[str]:
+        return [
+            f"SET D0F1 {dac0_f1:.4f}",
+            f"SET D0F2 {dac0_f2:.4f}",
+            f"SET D1F1 {dac1_f1:.4f}",
+            f"SET D1F2 {dac1_f2:.4f}",
+        ]
 
     def _apply_params(
         self,
         include_frequencies: bool = True,
-        f1: float | None = None,
-        f2: float | None = None,
+        dac0_f1: float | None = None,
+        dac0_f2: float | None = None,
+        dac1_f1: float | None = None,
+        dac1_f2: float | None = None,
         header: str = "Применение параметров…",
     ) -> bool:
         if not self.serial.is_open:
             return False
         p = self._get_params()
-        target_f1 = p["f1"] if f1 is None else f1
-        target_f2 = p["f2"] if f2 is None else f2
         cmds = [
             f"SET A1 {p['a1']:.4f}",
             f"SET P1 {p['p1']:.2f}",
@@ -2088,8 +2209,14 @@ class MainWindow(QMainWindow):
             f"SET SR {int(p['sr'])}",
         ]
         if include_frequencies:
-            cmds.insert(1, f"SET F1 {target_f1:.4f}")
-            cmds.insert(4, f"SET F2 {target_f2:.4f}")
+            cmds.extend(
+                self._frequency_commands(
+                    p["dac0_f1"] if dac0_f1 is None else dac0_f1,
+                    p["dac0_f2"] if dac0_f2 is None else dac0_f2,
+                    p["dac1_f1"] if dac1_f1 is None else dac1_f1,
+                    p["dac1_f2"] if dac1_f2 is None else dac1_f2,
+                )
+            )
 
         self._log(header, COLORS["accent"])
         for cmd in cmds:
@@ -2109,31 +2236,28 @@ class MainWindow(QMainWindow):
             return False
 
         p = self._get_params()
-        a2_cmd = "SET A2 0.0000" if step.f2 is None else f"SET A2 {p['a2']:.4f}"
-        if step.f2 is None:
-            self._sequence_a2_restore_needed = True
-
         if include_static:
             cmds = [
                 f"SET A1 {p['a1']:.4f}",
-                f"SET F1 {step.f1:.4f}",
                 f"SET P1 {p['p1']:.2f}",
-                a2_cmd,
-            ]
-            if step.f2 is not None:
-                cmds.append(f"SET F2 {step.f2:.4f}")
-            cmds.extend(
-                [
-                    f"SET P2 {p['p2']:.2f}",
-                    f"SET DC {p['dc']:.4f}",
-                    f"SET GM {p['gain_max']:.2f}",
-                    f"SET SR {int(p['sr'])}",
-                ]
+                f"SET A2 {p['a2']:.4f}",
+                f"SET P2 {p['p2']:.2f}",
+                f"SET DC {p['dc']:.4f}",
+                f"SET GM {p['gain_max']:.2f}",
+                f"SET SR {int(p['sr'])}",
+            ] + self._frequency_commands(
+                step.dac0_f1,
+                step.dac0_f2,
+                step.dac1_f1,
+                step.dac1_f2,
             )
         else:
-            cmds = [f"SET F1 {step.f1:.4f}", a2_cmd]
-            if step.f2 is not None:
-                cmds.append(f"SET F2 {step.f2:.4f}")
+            cmds = self._frequency_commands(
+                step.dac0_f1,
+                step.dac0_f2,
+                step.dac1_f1,
+                step.dac1_f2,
+            )
 
         if header:
             self._log(header, COLORS["accent"])
@@ -2141,15 +2265,6 @@ class MainWindow(QMainWindow):
             self._log(f"  → {cmd}", COLORS["accent2"])
             self._send(cmd)
         return True
-
-    def _restore_sequence_second_signal(self):
-        if not self._sequence_a2_restore_needed or not self.serial.is_open:
-            self._sequence_a2_restore_needed = False
-            return
-        cmd = f"SET A2 {self.amp2.value():.4f}"
-        self._log(f"  → {cmd} (восстановление Синуса 2)", COLORS["accent2"])
-        self._send(cmd)
-        self._sequence_a2_restore_needed = False
 
     def _start(self):
         if self.sequence_steps:
@@ -2167,7 +2282,13 @@ class MainWindow(QMainWindow):
         resp = self._send("START")
         if resp and "OK" in resp:
             p = self._get_params()
-            if not self._begin_lsl_recording(step_index=0, f1=p["f1"], f2=p["f2"]):
+            if not self._begin_lsl_recording(
+                step_index=0,
+                dac0_f1=p["dac0_f1"],
+                dac0_f2=p["dac0_f2"],
+                dac1_f1=p["dac1_f1"],
+                dac1_f2=p["dac1_f2"],
+            ):
                 self._send("STOP")
                 return
             self._running = True
@@ -2187,7 +2308,6 @@ class MainWindow(QMainWindow):
 
         self._auto_apply_timer.stop()
         self._sequence_index = 0
-        self._sequence_a2_restore_needed = False
         self._reset_sequence_progress(self._sequence_total_seconds())
         self._running = True
         self.start_btn.setEnabled(False)
@@ -2216,9 +2336,10 @@ class MainWindow(QMainWindow):
         step = self.sequence_steps[self._sequence_index]
         step_no = self._sequence_index + 1
         total = len(self.sequence_steps)
-        f2_text = "выкл." if step.f2 is None else f"{step.f2:.4f} Гц"
         self._log(
-            f"[SEQ {step_no}/{total}] F1={step.f1:.4f} Гц  F2={f2_text}  "
+            f"[SEQ {step_no}/{total}] "
+            f"DAC0=({step.dac0_f1:.4f}, {step.dac0_f2:.4f}) Гц  "
+            f"DAC1=({step.dac1_f1:.4f}, {step.dac1_f2:.4f}) Гц  "
             f"длительность={step.seconds:.3f} с",
             COLORS["accent"],
         )
@@ -2238,7 +2359,13 @@ class MainWindow(QMainWindow):
             if not resp or "OK" not in resp:
                 self._abort_sequence("команда START не подтверждена")
                 return
-            if not self._begin_lsl_recording(step_index=step_no, f1=step.f1, f2=step.f2):
+            if not self._begin_lsl_recording(
+                step_index=step_no,
+                dac0_f1=step.dac0_f1,
+                dac0_f2=step.dac0_f2,
+                dac1_f1=step.dac1_f1,
+                dac1_f2=step.dac1_f2,
+            ):
                 self._abort_sequence("LSL-запись не началась")
                 return
             if self.dbg_checkbox.isChecked():
@@ -2247,7 +2374,13 @@ class MainWindow(QMainWindow):
             if not self._apply_sequence_step_params(step, include_static=False):
                 self._abort_sequence("serial-порт не подключен")
                 return
-            self._set_current_stim(step_no, step.f1, step.f2)
+            self._set_current_stim(
+                step_no,
+                step.dac0_f1,
+                step.dac0_f2,
+                step.dac1_f1,
+                step.dac1_f2,
+            )
 
         self._begin_sequence_stage_progress(step_no, total, step.seconds)
         self._sequence_index += 1
@@ -2266,7 +2399,6 @@ class MainWindow(QMainWindow):
         if self.serial.is_open:
             self._log("→ STOP", COLORS["red"])
             self._send("STOP")
-            self._restore_sequence_second_signal()
         if self._recording_active:
             self._stop_lsl_recording(export=True)
         self._running = False
@@ -2285,8 +2417,6 @@ class MainWindow(QMainWindow):
         self._log("→ STOP", COLORS["red"])
         if self.serial.is_open:
             self._send("STOP")
-            if self.sequence_steps:
-                self._restore_sequence_second_signal()
         if self._recording_active or self.lsl_worker is not None:
             self._stop_lsl_recording(export=export)
         self._running = False

@@ -123,6 +123,9 @@ QGroupBox::title {{
     left: 12px;
     padding: 0 6px;
 }}
+QLabel {{
+    background-color: transparent;
+}}
 QFrame#card {{
     background-color: {COLORS['surface']};
     border: 1px solid {COLORS['border']};
@@ -305,6 +308,7 @@ QFrame#divider {{
     max-height: 1px;
 }}
 QCheckBox {{
+    background-color: transparent;
     color: {COLORS['text_dim']};
     font-size: 11px;
     spacing: 6px;
@@ -791,8 +795,16 @@ class MainWindow(QMainWindow):
         grid.setColumnStretch(1, 1)
         grid.addWidget(self._build_sine_box("Синус 1", "1", COLORS["sine1"]), 0, 0)
         grid.addWidget(self._build_sine_box("Синус 2", "2", COLORS["sine2"]), 0, 1)
-        grid.addWidget(self._build_dac_box("DAC0", "dac0", COLORS["accent"]), 1, 0)
-        grid.addWidget(self._build_dac_box("DAC1", "dac1", COLORS["combined"]), 1, 1)
+        grid.addWidget(
+            self._build_dac_box("DAC0 (канал 1)", "dac0", COLORS["accent"]),
+            1,
+            0,
+        )
+        grid.addWidget(
+            self._build_dac_box("DAC1 (канал 2)", "dac1", COLORS["combined"]),
+            1,
+            1,
+        )
         layout.addLayout(grid)
         return card
 
@@ -817,7 +829,14 @@ class MainWindow(QMainWindow):
 
         self.sequence_table = QTableWidget(0, 6)
         self.sequence_table.setHorizontalHeaderLabels(
-            ["№ этапа", "DAC0 F1", "DAC0 F2", "DAC1 F1", "DAC1 F2", "Оставшееся время"]
+            [
+                "№ этапа",
+                "DAC0 (канал 1) F1",
+                "DAC0 (канал 1) F2",
+                "DAC1 (канал 2) F1",
+                "DAC1 (канал 2) F2",
+                "Оставшееся время",
+            ]
         )
         self.sequence_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.sequence_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
@@ -1121,12 +1140,12 @@ class MainWindow(QMainWindow):
             grid.addWidget(lb, 0, col)
             grid.addWidget(vl, 1, col)
 
-        stat("DAC0 пик", "stat_dac0_peak", 0)
-        stat("DAC0 минимум", "stat_dac0_trough", 1)
-        stat("DAC0 размах", "stat_dac0_range", 2)
-        stat("DAC1 пик", "stat_dac1_peak", 3)
-        stat("DAC1 минимум", "stat_dac1_trough", 4)
-        stat("DAC1 размах", "stat_dac1_range", 5)
+        stat("DAC0 (канал 1) пик", "stat_dac0_peak", 0)
+        stat("DAC0 (канал 1) минимум", "stat_dac0_trough", 1)
+        stat("DAC0 (канал 1) размах", "stat_dac0_range", 2)
+        stat("DAC1 (канал 2) пик", "stat_dac1_peak", 3)
+        stat("DAC1 (канал 2) минимум", "stat_dac1_trough", 4)
+        stat("DAC1 (канал 2) размах", "stat_dac1_range", 5)
         stat("Найквист", "stat_nyquist", 6)
         return frame
 
@@ -1148,12 +1167,12 @@ class MainWindow(QMainWindow):
         metrics = (
             ("ISR", self.dstat_isr),
             ("Samples", self.dstat_samps),
-            ("DAC0 clip+", self.dstat_cliphi0),
-            ("DAC0 clip-", self.dstat_cliplo0),
-            ("DAC0 env", self.dstat_env0),
-            ("DAC1 clip+", self.dstat_cliphi1),
-            ("DAC1 clip-", self.dstat_cliplo1),
-            ("DAC1 env", self.dstat_env1),
+            ("DAC0 (канал 1) clip+", self.dstat_cliphi0),
+            ("DAC0 (канал 1) clip-", self.dstat_cliplo0),
+            ("DAC0 (канал 1) env", self.dstat_env0),
+            ("DAC1 (канал 2) clip+", self.dstat_cliphi1),
+            ("DAC1 (канал 2) clip-", self.dstat_cliplo1),
+            ("DAC1 (канал 2) env", self.dstat_env1),
         )
         for idx, (label, value) in enumerate(metrics):
             row = idx // 4

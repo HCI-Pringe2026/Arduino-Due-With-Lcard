@@ -810,11 +810,8 @@ class MainWindow(QMainWindow):
 
     def _build_experiment_card(self) -> QFrame:
         card, layout = self._make_card("Эксперимент")
-        row = QHBoxLayout()
-        row.setSpacing(8)
-        row.addWidget(self._build_global_box(), 3)
-        row.addWidget(self._build_sequence_box(), 2)
-        layout.addLayout(row)
+        layout.addWidget(self._build_global_box())
+        layout.addWidget(self._build_sequence_box())
         return card
 
     def _build_preview_tab(self) -> QWidget:

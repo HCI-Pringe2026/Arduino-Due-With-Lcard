@@ -88,6 +88,8 @@ static inline void writePwmDuty(uint32_t duty) {
 }
 
 static inline uint32_t voltageToPwm(float v) {
+    v -= 2.0f;
+    if (v < 0) v = 0;
     uint32_t d = (uint32_t)(v / DAC_VREF * PWM_PERIOD_F + 0.5f);
     if (d > PWM_PERIOD) d = PWM_PERIOD;
     return d;
@@ -149,7 +151,7 @@ void TC6_Handler(void) {
 
     if (!g_running) {
         // Idle: PWM 50 % (mid-rail) and DAC1 to zero
-        writePwmDuty(PWM_PERIOD / 2u);
+        writePwmDuty(0);
         writeDac1(0);
         return;
     }
@@ -272,8 +274,7 @@ void setupPWM() {
     while (PWM->PWM_SR & (1u << g_pwmChannel));
 
     PWM->PWM_CH_NUM[g_pwmChannel].PWM_CMR =
-          PWM_CMR_CPRE_MCK
-        | PWM_CMR_CALG;
+          PWM_CMR_CPRE_MCK;
 
     PWM->PWM_CH_NUM[g_pwmChannel].PWM_CPRD = PWM_PERIOD;
     PWM->PWM_CH_NUM[g_pwmChannel].PWM_CDTY = PWM_PERIOD / 2u;
@@ -368,7 +369,7 @@ void processCommand(const char *cmd) {
 
     if (strncmp(cmd, "STOP", 4) == 0) {
         g_running = false;
-        writePwmDuty(PWM_PERIOD / 2u);   // idle: mid-rail
+        writePwmDuty(0);   // idle: mid-rail
         writeDac1(0);
         Serial.println("OK STOP");
         return;

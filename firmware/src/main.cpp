@@ -5,24 +5,22 @@
 // ---------------------------------------------------------------------------
 // PWM configuration for "DAC0" channel
 // ---------------------------------------------------------------------------
-// DAC0 is replaced by a PWM output on Pin 6 (PWMH4 / PWMC channel 4).
-// This peripheral is entirely independent of TC2/Ch0 used for the sample-rate
-// ISR (TC6_IRQn) and of the system-timer channel (TC0 Ch2 / millis).
+// Channel 0 is emitted as PWM on any Arduino Due PWM-capable pin that can be
+// driven safely via analogWrite(). DAC1 remains a true analog output via DACC
+// channel 1.
 //
-// PWM carrier: 84 MHz / PWM_PERIOD = ~195 kHz with PWM_PERIOD = 431.
-//   - 195 kHz carrier sits ~390× above the 500 Hz Nyquist limit at SR=1000.
-//   - A simple RC low-pass filter on Pin 6 reconstructs the analog voltage:
-//       R = 1 kΩ, C = 10 nF  →  fc ≈ 16 kHz   (passes signal, kills carrier)
-//   - Without this filter the output is a square wave, not an analog signal.
-//
-// Pin assignment:
-//   Pin 6  →  PWM output (DAC0 replacement) — add RC filter to use as analog
-//   DAC1   →  true analog output (unchanged), via DACC channel 1
+// To select another PWM pin, change PWM_DAC0_PIN below or override it from the
+// build system.  Add an RC low-pass filter on that pin if you need an analog
+// voltage instead of raw PWM. Pins 4 and 5 are excluded because TC2 channel 0
+// is reserved for the sample-rate ISR.
 // ---------------------------------------------------------------------------
 
-static const uint8_t  PWM_PIN        = 6;      // PWMH4 — safe, no TC conflict
-static const uint32_t PWM_PERIOD     = 431u;   // 84 MHz / 431 ≈ 195 kHz carrier
-static const float    PWM_PERIOD_F   = 431.0f;
+#ifndef PWM_DAC0_PIN
+#define PWM_DAC0_PIN 6
+#endif
+
+static const uint8_t  PWM_PIN      = PWM_DAC0_PIN;
+static const uint16_t PWM_MAX_DUTY = 4095u;
 
 static const float DAC_VREF      = 3.3f;
 static const uint16_t DAC_MAX    = 4095;
@@ -69,23 +67,30 @@ float clampDC(float dc)        { return constrain(dc, 0.0f, MAX_DC); }
 float clampFreq(float f)       { return constrain(f, 0.0f, MAX_FREQ); }
 float degToRad(float d)        { return d * (float)PI / 180.0f; }
 
+static inline bool isSupportedPwmPin(uint8_t pin) {
+    return pin < PINS_COUNT && digitalPinHasPWM(pin);
+}
+
+static inline bool conflictsWithSampleTimer(uint8_t pin) {
+    return pin == 4u || pin == 5u;
+}
+
 static inline void wrapPhase(volatile float &phase) {
     if (phase >  TWO_PI) phase -= TWO_PI;
     if (phase < -TWO_PI) phase += TWO_PI;
 }
 
 // ---------------------------------------------------------------------------
-// PWM output for channel 0 (Pin 6 / PWMC channel 4)
-// Duty cycle spans 0 … PWM_PERIOD, mapping linearly to 0 … DAC_VREF.
+// PWM output for channel 0 (generic PWM-capable pin via analogWrite)
+// Duty cycle spans 0 … 4095, matching the 12-bit DAC range.
 // ---------------------------------------------------------------------------
 static inline void writePwmDuty(uint32_t duty) {
-    // CDTYUPD: update duty cycle on next period boundary (glitch-free)
-    PWM->PWM_CH_NUM[4].PWM_CDTYUPD = duty;
+    analogWrite(PWM_PIN, duty);
 }
 
 static inline uint32_t voltageToPwm(float v) {
-    uint32_t d = (uint32_t)(v / DAC_VREF * PWM_PERIOD_F + 0.5f);
-    if (d > PWM_PERIOD) d = PWM_PERIOD;
+    uint32_t d = (uint32_t)(v / DAC_VREF * (float)PWM_MAX_DUTY + 0.5f);
+    if (d > PWM_MAX_DUTY) d = PWM_MAX_DUTY;
     return d;
 }
 
@@ -145,7 +150,7 @@ void TC6_Handler(void) {
 
     if (!g_running) {
         // Idle: PWM 50 % (mid-rail) and DAC1 to zero
-        writePwmDuty(PWM_PERIOD / 2);
+        writePwmDuty((PWM_MAX_DUTY + 1u) / 2u);
         writeDac1(0);
         return;
     }
@@ -190,7 +195,7 @@ void TC6_Handler(void) {
         if (v[ch] < g_dbgTroughV[ch]) g_dbgTroughV[ch] = v[ch];
     }
 
-    // Channel 0 → PWM on Pin 6
+    // Channel 0 → PWM on the selected PWM-capable pin
     writePwmDuty(voltageToPwm(v[0]));
 
     // Channel 1 → true analog DAC1
@@ -243,38 +248,25 @@ void setupDACC() {
 }
 
 // ---------------------------------------------------------------------------
-// PWM peripheral setup — PWMC channel 4, Pin 6 (PWMH4)
-//
-// PWMC is clocked from the 84 MHz master clock via its own prescaler chain,
-// completely independent of TC2 and the system timer.  No shared resources.
-//
-// Carrier:  84 MHz / PWM_PERIOD = ~195 kHz
-// Left-aligned, no dead-time, no sync trigger needed.
+// PWM setup for DAC0 replacement on a PWM-capable pin.
+// Frequency is controlled by the Arduino Due core for the selected backend
+// (PWMC or TC), while DAC1 remains on the hardware DAC peripheral.
 // ---------------------------------------------------------------------------
 void setupPWM() {
-    // Enable PWMC clock
-    pmc_enable_periph_clk(ID_PWM);
+    if (!isSupportedPwmPin(PWM_PIN)) {
+        Serial.print("ERR PWM pin unsupported: ");
+        Serial.println(PWM_PIN);
+        while (true) delay(1000);
+    }
+    if (conflictsWithSampleTimer(PWM_PIN)) {
+        Serial.print("ERR PWM pin conflicts with sample timer: ");
+        Serial.println(PWM_PIN);
+        while (true) delay(1000);
+    }
 
-    // Configure Pin 6 as PWMH4 (peripheral B on PIO_C24)
-    PIOC->PIO_PDR  =  PIO_PC24;   // surrender pin to peripheral
-    PIOC->PIO_ABSR |= PIO_PC24;   // select peripheral B
-
-    // Disable channel 4 before configuring
-    PWM->PWM_DIS = PWM_DIS_CHID4;
-    while (PWM->PWM_SR & PWM_SR_CHID4);
-
-    // Clock: MCK / 1 = 84 MHz (CPRE = 0 → MCK, CPRDUPD not needed)
-    PWM->PWM_CH_NUM[4].PWM_CMR =
-          PWM_CMR_CPRE_MCK        // 84 MHz clock source
-        | PWM_CMR_CALG            // left-aligned (clear on compare)
-        ;                         // polarity: output high when counter < duty
-
-    // Period and initial duty (mid-rail = 50 %)
-    PWM->PWM_CH_NUM[4].PWM_CPRD  = PWM_PERIOD;
-    PWM->PWM_CH_NUM[4].PWM_CDTY  = PWM_PERIOD / 2;
-
-    // Enable channel
-    PWM->PWM_ENA = PWM_ENA_CHID4;
+    pinMode(PWM_PIN, OUTPUT);
+    analogWriteResolution(12);
+    writePwmDuty((PWM_MAX_DUTY + 1u) / 2u);
 }
 
 // ---------------------------------------------------------------------------
@@ -364,7 +356,7 @@ void processCommand(const char *cmd) {
 
     if (strncmp(cmd, "STOP", 4) == 0) {
         g_running = false;
-        writePwmDuty(PWM_PERIOD / 2);   // idle: mid-rail
+        writePwmDuty((PWM_MAX_DUTY + 1u) / 2u);   // idle: mid-rail
         writeDac1(0);
         Serial.println("OK STOP");
         return;
@@ -468,17 +460,18 @@ void setup() {
     while (!Serial);
 
     setupDACC();        // DAC1 true analog
-    setupPWM();         // Pin 6 ~195 kHz PWM (DAC0 replacement)
+    setupPWM();         // DAC0 replacement on the selected PWM-capable pin
     resetDebugStats();
     recomputeAllIncrements();
     setupTimer(g_sampleRate);   // 1000 Hz sample rate ISR on TC6
 
     NVIC_SetPriority(UART_IRQn, 0);
     NVIC_SetPriority(TC6_IRQn,  1);
-    // PWMC runs autonomously in hardware — no IRQ priority needed
-    // PWM_IRQn is not enabled; duty updates are register writes only
+    // PWM is handled by the Arduino core on the selected PWM backend
 
-    Serial.println("READY dual_dac_sine v4.1 (ch0=PWM pin6, ch1=DAC1)");
+    Serial.print("READY dual_dac_sine v4.2 (ch0=PWM pin ");
+    Serial.print(PWM_PIN);
+    Serial.println(", ch1=DAC1)");
 }
 
 void loop() {

@@ -597,6 +597,13 @@ class MainWindow(QMainWindow):
         self._total_clip_lo = [0, 0]
         QTimer.singleShot(0, self._attempt_initial_connections)
 
+    def _on_lsl_combo_changed(self, idx: int):
+        self._update_lsl_stream_preview()
+        # Переподключаемся только если уже был подключён другой поток,
+        # или если это первый выбор после refresh
+        if self.lsl_inlet is not None:
+            self._connect_selected_lsl_stream()
+
     # ── UI construction ───────────────────────────────────────────────────────
     def _build_ui(self):
         central = QWidget()
@@ -759,8 +766,7 @@ class MainWindow(QMainWindow):
 
         self.lsl_stream_combo = QComboBox()
         self.lsl_stream_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.lsl_stream_combo.currentIndexChanged.connect(self._update_lsl_stream_preview)
-        self.lsl_stream_combo.activated.connect(self._connect_selected_lsl_stream)
+        self.lsl_stream_combo.currentIndexChanged.connect(self._on_lsl_combo_changed)
 
         self.lsl_connect_check = QCheckBox()
         self.lsl_connect_check.setObjectName("lsl_status")
@@ -1344,7 +1350,10 @@ class MainWindow(QMainWindow):
             )
         self._restore_lsl_selection()
         self.lsl_status_label.setText(f"Найдено LSL-потоков: {len(self.lsl_streams)}")
-        self._set_lsl_checkbox(self.lsl_inlet is not None, enabled=True)
+        connected = self.lsl_inlet is not None
+        self._set_lsl_checkbox(connected, enabled=True)
+        if not connected:
+            self.lsl_meta_text.clear()
         self._update_lsl_stream_preview()
 
     def _update_lsl_stream_preview(self):
@@ -1456,7 +1465,8 @@ class MainWindow(QMainWindow):
                 ("library_version", "library_version"),
             ):
                 try:
-                    value = getattr(pylsl, attr)()
+                    val = getattr(pylsl, attr)
+                    value = val() if callable(val) else val
                 except Exception:
                     value = ""
                 if target == "protocol_version":
